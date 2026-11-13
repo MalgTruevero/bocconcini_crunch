@@ -489,7 +489,11 @@ class Digest:
                     continue
                 per = max(200, int(self.summary_chars / max(1, half)))
                 out = self._ask(self.t["merge"].format(chars=per, notes="\n---\n".join(pair)))
-                merged.append(_cut_sentence(out, per) if out else _cut_sentence("\n".join(pair), per))
+                if out:
+                    merged.append(_cut_sentence(out, per))
+                else:
+                    merged.append(_cut_sentence("\n".join(pair), per))
+                    self.stats["notes_cut_merge"] = self.stats.get("notes_cut_merge", 0) + 1
             if len(merged) >= len(self.notes):
                 break
             self.notes = merged
@@ -526,6 +530,8 @@ class Digest:
         """Final prompt, fitted to the budget. The question is never cut."""
         budget = int(budget_tokens or self.budget)
         t = self.t
+        def ntok(txt: str) -> int:
+            return int(len(txt) / self.cpt) + 1
 
         def render(notes: str, omitted: int, outlines: List[str], recent: List[Block]) -> str:
             mp = ("\n\n".join(outlines) if outlines else t["none_c"])
@@ -538,24 +544,26 @@ class Digest:
             return "\n".join(parts)
 
         notes, outlines, recent, omitted = self.text_notes, list(self.outlines), list(self.recent), 0
-        if self.stats.get("pieces_lost") or self.stats.get("pieces_unreliable"):
+        if (self.stats.get("pieces_lost") or self.stats.get("pieces_unreliable")
+                or self.stats.get("notes_cut_merge")):
             notes = (notes + "\n[WARNING: %d piece(s) of the document were lost or read from a truncated "
                      "context: that content is MISSING or UNRELIABLE. Say so if the "
                      "question needs it.]"
-                     % (self.stats.get("pieces_lost", 0) + self.stats.get("pieces_unreliable", 0))).strip()
+                     % (self.stats.get("pieces_lost", 0) + self.stats.get("pieces_unreliable", 0)
+                        + self.stats.get("notes_cut_merge", 0))).strip()
         out = render(notes, omitted, outlines, recent)
-        while estimate_tokens(out, "python") > budget and len(recent) > 1:
+        while ntok(out) > budget and len(recent) > 1:
             recent.pop(0)
             out = render(notes, omitted, outlines, recent)
-        while estimate_tokens(out, "python") > budget and len(outlines) > 1:
+        while ntok(out) > budget and len(outlines) > 1:
             outlines.pop(0)
             omitted += 1
             out = render(notes, omitted, outlines, recent)
-        if estimate_tokens(out, "python") > budget and notes:
-            over = estimate_tokens(out, "python") - budget
-            notes = _cut_sentence(notes, max(200, len(notes) - int(over * 3.2)))
+        if ntok(out) > budget and notes:
+            over = ntok(out) - budget
+            notes = _cut_sentence(notes, max(200, len(notes) - int(over * self.cpt)))
             out = render(notes, omitted, outlines, recent)
-        if estimate_tokens(out, "python") > budget and recent:
+        if ntok(out) > budget and recent:
             recent = []                                    # last resort: outlines still describe the code
             out = render(notes, omitted, outlines, recent)
         return out
