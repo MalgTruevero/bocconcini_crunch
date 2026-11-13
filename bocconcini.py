@@ -2292,6 +2292,43 @@ class LlamaCppClient:
         return out
 
     # -- public API ----------------------------------------------------------
+    def _spill(self, reply) -> None:
+        """Write a long answer to disk so the caller can hold a path, not the text.
+
+        Opt-in: BOCCONCINI_SPILL_CHARS (absent or 0 = off), BOCCONCINI_SPILL_DIR.
+        Never raises: an I/O problem must not destroy an answer already produced.
+        """
+        try:
+            limit = int(os.environ.get("BOCCONCINI_SPILL_CHARS") or 0)
+        except ValueError:
+            return
+        if limit <= 0 or not reply.text or len(reply.text) < limit:
+            return
+        try:
+            from pathlib import Path as _P
+            import hashlib as _h
+            env = os.environ.get("BOCCONCINI_SPILL_DIR")
+            if env:
+                folder = _P(env).expanduser()
+            else:
+                prof = _profile_path()
+                folder = (prof.parent if prof is not None else _P.home() / ".cache" / "bocconcini") / "spill"
+            folder.mkdir(parents=True, exist_ok=True)
+            tag = _h.blake2b(reply.text.encode("utf-8", "replace"), digest_size=4).hexdigest()
+            name = "spill_%s_%d_%s.txt" % (time.strftime("%Y%m%d_%H%M%S"), os.getpid(), tag)
+            target, tmp = folder / name, folder / (name + ".tmp")
+            tmp.write_text(reply.text, encoding="utf-8")
+            os.replace(str(tmp), str(target))
+            reply.meta["spill_path"] = str(target)
+            reply.meta["spill_chars"] = len(reply.text)
+            try:
+                reply.spill_path = str(target)
+            except Exception:
+                pass                      # frozen dataclass: meta already carries it
+            log.info("answer spilled to %s (%d chars)", target, len(reply.text))
+        except Exception as exc:
+            log.warning("cannot spill the answer (%s): keeping it in memory", exc)
+
     def chat_full(self, prompt: str = "", system: str = "", temperature: float = 0.7, *,
                   messages: Optional[List[Dict[str, Any]]] = None,
                   tools: Optional[List[Dict[str, Any]]] = None, max_tokens: Optional[int] = None,
@@ -2325,7 +2362,9 @@ class LlamaCppClient:
         c = _Call(msgs, temperature, tools, tool_choice, max_tokens, max_total_tokens, max_turns, thinking,
                   bool(strip_thinking), extra, timeout, bool(stream), on_partial, continua)
         with lavoro_atomico(self.base_url, blocca_altri=blocca_altri, timeout_attesa=timeout_attesa):
-            return self._run(c, force_action, action_validator, act_retries, auto_reduce, reduce_question)
+            reply = self._run(c, force_action, action_validator, act_retries, auto_reduce, reduce_question)
+        self._spill(reply)
+        return reply
 
     def _run(self, c: _Call, force_action: bool, validator: Optional[Callable[[ChatReply], bool]],
              act_retries: int, auto_reduce: Optional[bool], reduce_question: Optional[str]) -> ChatReply:
