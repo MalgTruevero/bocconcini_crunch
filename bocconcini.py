@@ -1515,6 +1515,10 @@ class LlamaCppClient:
         return info
 
     def _hw_key(self) -> str:
+        # Resolve the model name FIRST: on a fresh client _model_seen is empty
+        # and every profile lookup would land on "...|-" instead of the model.
+        if not self.model and not self._model_seen:
+            self._info()
         return "%s|%s" % (_root_url(self.base_url).lower(), self.model or self._model_seen or "-")
 
     def _hw(self) -> Dict[str, float]:
@@ -1594,6 +1598,151 @@ class LlamaCppClient:
             n = estimate_tokens(text, detect_kind(text))
         per_msg = self._hw().get("msg_overhead") or 8.0
         return n + int(per_msg * len(msgs)) + tools_tokens
+    # -- cognitive window ----------------------------------------------------
+    # Nominal n_ctx is not the usable window: a small model can hold 4096 tokens
+    # and still lose the thread at 1500. Nothing else here can see it: the server
+    # processes every token, no error is raised, the answer is simply wrong.
+    _COG_FLOOR = 256
+    _COG_PROVISIONAL = 512
+    _COG_STEPS = (512, 1024, 2048, 4096, 8192)
+
+    _COG_LOCK = threading.Lock()
+
+    def _cog_path(self) -> Optional[Path]:
+        p = _profile_path()
+        return p.with_name("cognitive_limit.json") if p is not None else None
+
+    def _cog_read(self) -> Dict[str, Any]:
+        p = self._cog_path()
+        if p is None or not p.exists():
+            return {}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+            e = data.get("entries") if isinstance(data, dict) else None
+            return e if isinstance(e, dict) else {}
+        except (ValueError, OSError):
+            return {}
+
+    def _cog_stored(self) -> Optional[int]:
+        """The measured window for THIS model at THIS n_ctx, or None.
+
+        Kept in its own file with no expiry: it is a property of the model, not of
+        the moment, and it costs minutes to measure. Speed measurements live in the
+        hardware profile and legitimately expire; this must not.
+        """
+        n_ctx = int(self._info()["n_ctx"])
+        with self._COG_LOCK:
+            e = self._cog_read().get(self._hw_key())
+        if isinstance(e, dict) and int(e.get("n_ctx") or 0) == n_ctx:
+            v = e.get("limit")
+            if isinstance(v, (int, float)) and v > 0:
+                return int(v)
+        return None
+
+    def _cog_store(self, limit: int, n_ctx: int) -> None:
+        """Write immediately and atomically. Never throttled: losing this costs
+        another calibration run."""
+        p = self._cog_path()
+        if p is None or not self.persist_profile:
+            return
+        with self._COG_LOCK:
+            entries = self._cog_read()
+            entries[self._hw_key()] = {"limit": int(limit), "n_ctx": int(n_ctx),
+                                       "measured": bool(limit > self._COG_FLOOR),
+                                       "ts": time.time()}
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_name(p.name + ".tmp.%d" % os.getpid())
+                tmp.write_text(json.dumps({"version": 1, "entries": entries}, ensure_ascii=False),
+                               encoding="utf-8")
+                os.replace(str(tmp), str(p))
+            except OSError as exc:
+                log.warning("cannot save the cognitive limit: %s", exc)
+
+
+    def _cog_probe(self, target: int, n_ctx: int) -> Optional[bool]:
+        """Needle-in-the-middle at ~``target`` prompt tokens.
+
+        The needle sits at half depth and its value is random every run: an
+        instruction at the END is passed at any size by recency bias, and a fixed
+        needle could be served from the server KV cache. The filler is sized by
+        MEASURED tokens, never by characters. None means "could not test".
+        """
+        needle = "%04d" % (int.from_bytes(os.urandom(2), "big") % 9000 + 1000)
+        unit = "La procedura descrive i passaggi dell'analisi del documento. "
+
+        def count(s: str) -> int:
+            tok = self.tokenizer
+            if tok is not None:
+                try:
+                    return int(tok.count_exact(s))
+                except Exception:
+                    pass
+            return estimate_tokens(s, "text")
+
+        half = max(1, (target - 48) // 2)
+        reps = max(1, half // max(1, count(unit)))
+        for _ in range(2):
+            n = count(unit * reps)
+            if n <= 0:
+                break
+            new = max(1, int(reps * half / n))
+            if new == reps:
+                break
+            reps = new
+        filler = unit * reps
+        msgs = [{"role": "user", "content":
+                 filler + "\n\nIl codice di verifica e' " + needle + ".\n\n" + filler +
+                 "\n\nQual e' il codice di verifica? Rispondi solo con le quattro cifre."}]
+        ptoks = self._prompt_tokens(msgs)
+        if ptoks > int(n_ctx * CTX_MARGIN) - 32:
+            return None
+        c = _Call(msgs, temperature=0.0, max_tokens=48, continua=False, stream=False)
+        r = self._turn_once(c, msgs, 48, False, None, None, ptoks, None)
+        digits = re.sub(r"\D", "", r.text or "")
+        log.info("cognitive probe: %d tokens, needle %s, answer %r", ptoks, needle, (r.text or "")[:40])
+        return needle in digits
+
+    def _cognitive_limit(self, n_ctx: Optional[int] = None) -> int:
+        """Largest prompt this model still handles reliably. Measured once, cached
+        in the hardware profile, invalidated when n_ctx changes."""
+        stored = self._cog_stored()
+        if stored:
+            return stored
+        n_ctx = int(n_ctx or self._info()["n_ctx"])
+        ceiling = int(n_ctx * CTX_MARGIN) - 64
+        limit = self._COG_FLOOR
+        with lavoro_atomico(self.base_url):
+            for target in self._COG_STEPS:
+                if target > ceiling:
+                    break
+                ok = None
+                for _try in range(2):
+                    try:
+                        ok = self._cog_probe(target, n_ctx)
+                    except ModelError as exc:
+                        log.warning("cognitive probe at %d failed: %s", target, exc)
+                        ok = False
+                    if ok:
+                        break
+                if not ok:
+                    break
+                limit = target
+        self._cog_store(limit, n_ctx)
+        log.warning("cognitive window: %d tokens (n_ctx=%d, %s)", limit, n_ctx,
+                    "measured" if limit > self._COG_FLOOR else "floor: first probe failed")
+        return limit
+
+    def working_budget(self, reserve: int = 512) -> int:
+        """Prompt budget: context minus reserve, capped by the cognitive window.
+        Reads the stored value: asking for a budget must never start a calibration."""
+        n_ctx = int(self._info()["n_ctx"])
+        budget = int(n_ctx * CTX_MARGIN) - max(0, int(reserve))
+        cog = self._cog_stored()
+        if cog:
+            budget = min(budget, int(cog))
+        return max(200, budget)
+
     def _plan(self, c: _Call, n_ctx: int, ptoks: int) -> Dict[str, Any]:
         plan = plan_budget(n_ctx, ptoks, max_tokens=c.max_tokens, tps=self._hw().get("tps"),
                            target_seconds=self.target_seconds)
@@ -2205,6 +2354,24 @@ class LlamaCppClient:
             reserve = min(max(c.max_tokens or 1024, 512), plan["usable"] // 2)
             msgs = self._reduce_messages(msgs, plan["usable"] - reserve - tools_tokens, reduce_question, meta)
             plan = self._plan(c, n_ctx, self._prompt_tokens(msgs, tools_tokens))
+        # The nominal window is not the usable one: a small model can hold every
+        # token and still lose the thread. Nothing else here can see it, because
+        # the server raises no error and the answer is simply wrong. Above the
+        # provisional size we consult the measured window (cached, one calibration
+        # per model + n_ctx). Refusing is the point: better late than wrong.
+        ptoks_now = plan["usable"] - plan["free"]
+        cog = 0
+        if (os.environ.get("BOCCONCINI_NO_COGNITIVE") != "1"
+                and ptoks_now > self._COG_PROVISIONAL):
+            cog = self._cognitive_limit(n_ctx)
+        if cog:
+            meta["cognitive_limit"] = cog
+            if ptoks_now > cog:
+                raise ModelError(
+                    "the prompt (~%d tokens) fits n_ctx=%d but exceeds this model\'s "
+                    "measured cognitive window (%d tokens): the answer would not be "
+                    "reliable. Split the task into smaller pieces." % (ptoks_now, n_ctx, cog),
+                    kind="cognitive_overflow")
         if not plan["fits"]:
             raise ModelError("the prompt (~%d tokens) does not fit n_ctx=%d%s" % (
                 self._prompt_tokens(msgs, tools_tokens), n_ctx, "" if info.get("detected") else
