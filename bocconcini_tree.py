@@ -302,7 +302,8 @@ _REGOLE = (
     "rileggerli. Quando puoi rispondere, rispondi senza chiamare strumenti. "
     "Non inventare il contenuto di un ramo che non hai letto. "
     "Le etichette e i numeri nell'indice sono INDIZI, non il documento: non citare un ramo "
-    "come fonte se non lo hai letto con leggi_nodo. Per un fatto del documento devi prima leggere.")
+    "come fonte se non lo hai letto con leggi_nodo. Per un fatto del documento devi prima leggere. "
+    "L'indice mostra solo una pagina: se un nome non appare, usa cerca_nodo(query) per trovarlo.")
 
 
 def _msg_tokens(msgs: List[Dict[str, Any]], cpt: float) -> int:
@@ -337,6 +338,23 @@ def _level_ids(tree: "DocTree", session: str, node_id: Optional[str] = None) -> 
     return [str(c["id"]) for c in (tree.keys(session).get(node_id, {}).get("children") or [])]
 
 
+_CERCA = {"type": "function", "function": {
+    "name": "cerca_nodo",
+    "description": "Cerca un nome o parola negli id/etichette dell'albero. Restituisce id completi. Usalo se il ramo non e' nella pagina visibile.",
+    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
+
+
+def _cerca(tree: "DocTree", session: str, query: str, limit: int = 8) -> Tuple[str, List[str]]:
+    q = (query or "").strip().lower()
+    if not q:
+        return "[query vuota]", []
+    hits = [k for k, v in tree.keys(session).items()
+            if q in k.lower() or q in str(v.get("label", "")).lower()][:limit]
+    if not hits:
+        return "[nessun ramo corrisponde a %r. Prova un altro nome.]" % query, []
+    return "Rami trovati (chiama leggi_nodo con l'id completo):\n" + "\n".join("- " + k for k in hits), hits
+
+
 def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
            budget_tokens: Optional[int] = None, chars_per_token: float = 3.2,
            max_hops: int = 3, max_repeats: int = 2, max_tokens: int = 400,
@@ -360,8 +378,11 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
         focus = str(roots[0]["id"])        # bare container: show the useful level immediately
     shown = _level_ids(tree, session, focus)
     vista = tree.vista(session, focus, budget_tokens=max(150, budget // 3), chars_per_token=cpt)
+    toks = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question))
+    named = [k for k in tree.keys(session) if k.rsplit(".", 1)[-1] in toks][:3]
+    hint = ("\n\nNomi della domanda presenti nell'albero (id completi): " + ", ".join(named)) if named else ""
     msgs: List[Dict[str, Any]] = [
-        {"role": "system", "content": _REGOLE + "\n\n" + vista["text"]},
+        {"role": "system", "content": _REGOLE + "\n\n" + vista["text"] + hint},
         {"role": "user", "content": question}]
     seen: Dict[str, int] = {}
     answer = ""
@@ -373,12 +394,16 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
             meta["forced_answer"] = True
         try:
             tc = "required" if (require_read and not meta["nodes_read"] and not final) else None
-            r = client.chat_full(messages=msgs, tools=None if final else [_LEGGI], tool_choice=tc,
+            r = client.chat_full(messages=msgs, tools=None if final else [_LEGGI, _CERCA], tool_choice=tc,
                                  temperature=temperature, max_tokens=max_tokens, continua=False)
         except Exception as exc:
             meta["stopped"] = "error: %s" % exc
             break
         if not r.tool_calls:
+            if require_read and not meta["nodes_read"] and not final and not meta.get("nudged"):
+                meta["nudged"] = True
+                msgs.append({"role": "user", "content": "Non hai letto nessun ramo. L'indice non e' il documento: chiama cerca_nodo o leggi_nodo prima di rispondere."})
+                continue
             answer = r.text
             break
         meta["hops"] += 1
@@ -389,6 +414,16 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                 args = json.loads(call.get("function", {}).get("arguments") or "{}")
             except ValueError:
                 args = {}
+            fname = str(call.get("function", {}).get("name") or "")
+            if fname == "cerca_nodo":
+                q = str(args.get("query") or args.get("id") or "")
+                body, _h = _cerca(tree, session, q, 8)
+                meta.setdefault("searches", []).append(q)
+                msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": body, "_node": ""})
+                continue
+            if fname not in ("", "leggi_nodo"):
+                msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": "[strumento sconosciuto: usa leggi_nodo o cerca_nodo]", "_node": ""})
+                continue
             nid = str(args.get("id") or "")
             if nid not in valid:
                 bare = nid.rsplit(".", 1)[-1]
