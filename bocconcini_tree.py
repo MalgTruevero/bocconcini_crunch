@@ -318,15 +318,17 @@ def _evict(msgs: List[Dict[str, Any]], budget: int, cpt: float) -> int:
     while _msg_tokens(msgs, cpt) > budget:
         target = None
         for i, m in enumerate(msgs):
-            if (i != newest and m.get("role") == "tool"
-                    and m.get("_node") and not m.get("_stub")):
+            if i != newest and m.get("role") == "tool" and not m.get("_stub"):
                 target = i
                 break
         if target is None:
             break
-        nid = msgs[target]["_node"]
-        msgs[target]["content"] = ("[ramo %s rimosso dal contesto per fare spazio: e' ancora su "
-                                   "disco, chiama leggi_nodo('%s') per rileggerlo]" % (nid, nid))
+        nid = msgs[target].get("_node") or ""
+        if nid:
+            msgs[target]["content"] = ("[ramo %s rimosso dal contesto per fare spazio: e' ancora su "
+                                       "disco, chiama leggi_nodo('%s') per rileggerlo]" % (nid, nid))
+        else:
+            msgs[target]["content"] = "[esito precedente rimosso per fare spazio; usa cerca_nodo o leggi_nodo se ti serve]"
         msgs[target]["_stub"] = True
         removed += 1
     return removed
@@ -377,7 +379,7 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
     if len(roots) == 1 and roots[0].get("children"):
         focus = str(roots[0]["id"])        # bare container: show the useful level immediately
     shown = _level_ids(tree, session, focus)
-    vista = tree.vista(session, focus, budget_tokens=max(150, budget // 3), chars_per_token=cpt)
+    vista = tree.vista(session, focus, budget_tokens=max(150, budget // 4), chars_per_token=cpt)
     toks = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question))
     named = [k for k in tree.keys(session) if k.rsplit(".", 1)[-1] in toks][:3]
     hint = ("\n\nNomi della domanda presenti nell'albero (id completi): " + ", ".join(named)) if named else ""
@@ -388,13 +390,22 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
     answer = ""
     hops = max(0, int(max_hops))
     for turn in range(hops + 1):
-        meta["evicted"] += _evict(msgs, budget, cpt)
         final = turn >= hops
+        tools_now = None if final else ([_LEGGI] if (require_read and not meta["nodes_read"]) else [_LEGGI, _CERCA])
+        meta["evicted"] += _evict(msgs, max(200, budget - 256), cpt)
+        try:
+            tt = int(len(json.dumps(tools_now, ensure_ascii=False)) / 2.5) + 1 if tools_now else 0
+            pt = client._prompt_tokens(msgs, tt)
+        except Exception:
+            pt = _msg_tokens(msgs, cpt) + (256 if tools_now else 0)
+        if pt > budget:
+            meta["stopped"] = "budget: prompt ~%d > %d" % (pt, budget)
+            break
         if final:
             meta["forced_answer"] = True
         try:
             tc = "required" if (require_read and not meta["nodes_read"] and not final) else None
-            r = client.chat_full(messages=msgs, tools=None if final else [_LEGGI, _CERCA], tool_choice=tc,
+            r = client.chat_full(messages=msgs, tools=tools_now, tool_choice=tc,
                                  temperature=temperature, max_tokens=max_tokens, continua=False)
         except Exception as exc:
             meta["stopped"] = "error: %s" % exc
@@ -425,6 +436,13 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                 msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": "[strumento sconosciuto: usa leggi_nodo o cerca_nodo]", "_node": ""})
                 continue
             nid = str(args.get("id") or "")
+            if not nid:
+                meta["empty_ids"] = meta.get("empty_ids", 0) + 1
+                sug = ", ".join(named or shown) or "(nessuno)"
+                msgs.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                             "content": "[id vuoto: chiama leggi_nodo con l'id completo di un ramo, es. %s]" % sug,
+                             "_node": ""})
+                continue
             if nid not in valid:
                 bare = nid.rsplit(".", 1)[-1]
                 cand = [k for k in valid if k.rsplit(".", 1)[-1] == bare]

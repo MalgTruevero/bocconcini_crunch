@@ -1677,6 +1677,12 @@ class LlamaCppClient:
         real = reply.meta.get("prompt_tokens_real")
         if not isinstance(real, int) or real <= 0 or ptoks <= 0:
             return
+        # A cut is only possible NEAR the window. Far from it, a shortfall is our
+        # own estimate (tool schema + learned per-message overhead), not a server
+        # truncation: flagging it would skip retries on a perfectly healthy reply.
+        usable = int((self.n_ctx or self._info()["n_ctx"]) * CTX_MARGIN)
+        if ptoks < usable * 0.9:
+            return
         slack = max(16, min(64, ptoks // 10))
         if real >= ptoks * (0.90 if self._exact_counts() else 0.55) or real >= ptoks - slack:
             return
