@@ -23,6 +23,28 @@ Chunking guarantees
 
 Android/Termux: call from a worker thread, never from the UI thread.
 
+CHANGELOG 4.2.0
+  * JSON no longer torn apart: the old boundary scan capped depth at 2 above 500 KB and gave up
+    above 5 MB, so big/minified documents were cut INSIDE strings (99-100% of the cuts in our
+    stress test). Now every cut is outside strings, at any depth and any size; escapes
+    (\\", \\\\, \\uXXXX) are never split; a document with one giant string is cut at sentences.
+    New kind "jsonish" (single-quoted dict/list repr), JSON Lines and JSON slices are detected.
+    The Python path (tokenize) is untouched, and a test proves it is byte-identical.
+  * Merged from the 13 November file: prefill-aware watchdog patience, opt-in answer spill
+    (BOCCONCINI_SPILL_CHARS), working_budget(reserve).
+
+CHANGELOG 4.1.0
+  * A watchdog abort now really interrupts a blocked read (the raw socket is kept: http.client
+    drops ``conn.sock`` on Connection: close responses, so the old abort did nothing).
+  * A KV-cache hit is no longer reported as a silently truncated prompt (prompt_total is used);
+    with estimated token counts only a drastic shortfall counts.
+  * Continuation no longer re-sends the whole conversation: ``continuation_context``
+    "full" | "light" | "auto" (light = system + cut last user message), smaller tail (<=512 tokens),
+    ``cache_prompt`` for llama.cpp. Too-long histories are trimmed oldest-first before any message
+    content is reduced.
+  * Tokenizer fallback uses the same estimate as everywhere else (was 14% too pessimistic).
+  * ``working_budget()`` for document pipelines; see the companion module bocconcini_docs.
+
 CHANGELOG 4.0.1
   Fixed (verified on KoboldCpp, Samsung S20 Ultra / Termux):
     * prompt sizing is now measured, not guessed: the server tokenizer is
@@ -54,6 +76,7 @@ CHANGELOG 4.0.1
 from __future__ import annotations
 
 import bisect
+from array import array
 import hashlib
 import http.client
 import io
@@ -77,7 +100,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-__version__ = "4.0.1"
+__version__ = "4.2.0"
 __all__ = [
     "Chunk", "ChatReply", "ModelError", "TokenCounter", "TokenCounterLike",
     "estimate_tokens", "detect_kind", "iter_chunks", "split_text", "split_thinking", "strip_thinking",
@@ -106,7 +129,7 @@ MAX_OUTPUT_CHARS = 400_000
 MAX_REASONING_CHARS = 100_000
 _STREAM_TYPES = ("text/event-stream", "application/x-ndjson", "application/jsonl", "application/json-seq")
 _ACTION_PREFIX = "(Azione):"
-_OPTIONAL_FIELDS = ("stream_options", "tool_choice", "chat_template_kwargs", "think")
+_OPTIONAL_FIELDS = ("stream_options", "tool_choice", "chat_template_kwargs", "think", "cache_prompt")
 
 
 class ModelError(RuntimeError):
@@ -202,7 +225,7 @@ def _as_text(value: Any) -> str:
 # ----------------------------------------------------------------------------
 def _cpt(kind: str) -> float:
     """Pessimistic chars-per-token (over-counts tokens rather than under-counts)."""
-    return 2.5 if kind == "json" else 2.8 if kind == "python" else 3.2
+    return 2.5 if kind in ("json", "jsonish") else 2.8 if kind == "python" else 3.2
 
 
 def estimate_tokens(text: Any, kind: str = "text") -> int:
@@ -270,22 +293,53 @@ _PY_LINE = r"^(?:def |class |import |from \S+ import |@\w)"
 _PY_TOP = ("def ", "class ", "async def ", "@")
 
 
+_DQ_KEY = re.compile(r'"[^"\n]{1,60}"\s*:')
+_SQ_KEY = re.compile(r"'[^'\n]{1,60}'\s*:")
+
+
+def _looks_like_jsonl(text: str) -> bool:
+    head = text[:4000]
+    lines = [ln for ln in head.split("\n") if ln.strip()]
+    if len(text) > 4000:
+        lines = lines[:-1]                      # the last line may be cut by the window
+    if len(lines) < 2 or lines[0].lstrip()[:1] not in ("{", "["):
+        return False
+    for ln in lines[:6]:
+        try:
+            json.loads(ln)
+        except ValueError:
+            return False
+    return True
+
+
 def detect_kind(text: str, name: str = "") -> str:
+    """"python", "json", "jsonish" (single-quoted dict/list repr) or "text"."""
     low = (name or "").lower()
     if low.endswith((".py", ".pyi", ".pyw")):
         return "python"
     if low.endswith((".json", ".jsonl", ".ndjson")):
         return "json"
     head = text[:4000]
-    if head.lstrip()[:1] in ("{", "["):
+    first = head.lstrip()[:1]
+    if first in ("{", "["):
         if len(text) <= 200_000:
             try:
                 json.loads(text)
                 return "json"
             except ValueError:
                 pass
-        elif head.count('"') >= 2 and (":" in head or "," in head) and not re.search(_PY_LINE, head, re.M):
+            if _looks_like_jsonl(text):
+                return "json"
+        n_sq, n_dq = len(_SQ_KEY.findall(head)), len(_DQ_KEY.findall(head))
+        if n_sq >= 3 and n_sq > n_dq:
+            return "jsonish"
+        if len(text) > 200_000 and head.count('"') >= 2 and (":" in head or "," in head) \
+                and not re.search(_PY_LINE, head, re.M):
             return "json"
+    # a slice of a bigger JSON document (e.g. a chunk being chunked again)
+    if first in ('{', '[', '"', ',', '}', ']') and len(_DQ_KEY.findall(head)) >= 3 \
+            and not re.search(_PY_LINE, head, re.M):
+        return "json"
     if len(re.findall(_PY_LINE, head, re.M)) >= 2:
         return "python"
     return "text"
@@ -336,50 +390,91 @@ def _text_boundaries(text: str) -> List[Tuple[int, int]]:
     return out
 
 
-def _json_boundaries(text: str) -> List[Tuple[int, int]]:
-    n = len(text)
-    if n > 5_000_000:
-        return _text_boundaries(text)
-    out: List[Tuple[int, int]] = []
-    depth, in_str, esc = 0, False, False
-    last = -10 ** 9
-    big = n > 500_000
-    min_gap = 80 if big else 10
-    max_depth = 2 if big else 10
-    for i, c in enumerate(text):
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-        elif c == '"':
-            in_str = True
-        elif c in "{[":
+# One regex walks the text: a whole string (escapes included) is ONE token that is skipped, so a quote,
+# brace or comma inside a string can never be taken for structure. An unterminated string (a cut
+# document) runs to the end of the text instead of flipping the state for everything after it.
+_JSON_TOK = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\Z)|[\[\]{},\n]', re.S)
+_JSONISH_TOK = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\Z)|\'[^\'\\]*(?:\\.[^\'\\]*)*(?:\'|\Z)|[\[\]{},\n]',
+                          re.S)
+
+
+def _json_boundaries(text: str, loose: bool = False) -> Tuple[Any, Any]:
+    """Cut points OUTSIDE strings, at every depth: after a comma or a newline.
+
+    Priority is -depth, so iter_chunks prefers the shallowest cut that fits (between records before
+    between fields). No depth cap, no size cap: the old caps (depth 2 above 500 KB, nothing above
+    5 MB) pushed big documents onto plain-text cuts, in the middle of strings.
+    ``loose=True`` also understands single-quoted strings (Python/JS dict repr).
+    """
+    offs, prios = array("q"), array("b")
+    depth = 0
+    for m in (_JSONISH_TOK if loose else _JSON_TOK).finditer(text):
+        c = text[m.start()]
+        if c == '"' or c == "'":
+            continue
+        if c == "{" or c == "[":
             depth += 1
-        elif c in "}]":
-            depth -= 1
-        elif c == "," or c == "\n":
-            if depth > max_depth or i - last < min_gap or len(out) >= 200_000:
-                continue
-            out.append((i + 1, -depth))
-            last = i
-    if len(out) < 5 and n > 10000:
-        return _text_boundaries(text)
-    return out
+        elif c == "}" or c == "]":
+            depth = depth - 1 if depth > 0 else 0
+        else:
+            offs.append(m.end())
+            prios.append(-min(depth, 127))
+    return offs, prios
 
 
-def _boundaries(text: str, kind: str) -> Tuple[List[int], List[int]]:
+def _boundaries(text: str, kind: str) -> Tuple[Any, Any]:
+    if kind in ("json", "jsonish"):
+        offs, prios = _json_boundaries(text, loose=(kind == "jsonish"))
+        if len(offs) >= 3 or len(text) <= 2000:
+            return offs, prios
+        # (almost) no structure: one giant string. Cut it at sentences/words, not at random.
     pairs: Optional[List[Tuple[int, int]]] = None
     if kind == "python":
         pairs = _python_boundaries(text)
-    elif kind == "json":
-        pairs = _json_boundaries(text)
     if pairs is None:
         pairs = _text_boundaries(text)
     pairs.sort()
     return [o for o, _ in pairs], [p for _, p in pairs]
+
+
+def _escape_safe(text: str, pos: int, floor: int) -> int:
+    """Move a cut that falls inside a JSON string back so it never splits ``\\"``, ``\\\\`` or ``\\uXXXX``."""
+    p = pos
+    while p > floor + 1:
+        j, run = p, 0
+        while j > 0 and text[j - 1] == "\\":
+            run += 1
+            j -= 1
+        if run % 2 == 1:                          # the previous char starts an escape
+            p -= 1
+            continue
+        moved = False
+        for idx in range(p - 1, max(floor, p - 6), -1):
+            if text[idx] == "u" and idx > 0 and text[idx - 1] == "\\" and p - idx - 1 < 4:
+                k, run = idx - 1, 0
+                while k >= 0 and text[k] == "\\":
+                    run += 1
+                    k -= 1
+                if run % 2 == 1:                  # a real \uXXXX cut before its 4th hex digit
+                    p = idx - 1
+                    moved = True
+                break
+        if not moved:
+            break
+    return p if p > floor else pos
+
+
+def _soft_cut(text: str, a: int, hard_end: int, kind: str) -> int:
+    """No structural boundary in the window. JSON: we are inside a long string -> sentence, then word,
+    never inside an escape. Anything else: whitespace."""
+    if kind in ("json", "jsonish"):
+        for pat in (". ", "! ", "? ", "; ", ", ", " "):
+            k = text.rfind(pat, a, hard_end)
+            if k != -1:
+                return _escape_safe(text, k + len(pat), a)
+        return _escape_safe(text, hard_end, a)
+    k = max(text.rfind(" ", a, hard_end), text.rfind("\n", a, hard_end))
+    return k + 1 if k >= a else hard_end
 
 
 # ----------------------------------------------------------------------------
@@ -560,9 +655,10 @@ def iter_chunks(text: str, name: str = "text", *, kind: Optional[str] = None, ma
             lo = bisect.bisect_left(offs, start + min_c)
             hi = bisect.bisect_right(offs, hard_end)
             if lo >= hi:
-                a = start + min_c
-                k = max(text.rfind(" ", a, hard_end), text.rfind("\n", a, hard_end))
-                end = k + 1 if k >= a else hard_end
+                if kind in ("json", "jsonish") and hi > 0 and offs[hi - 1] > start:
+                    end = offs[hi - 1]            # a real cut closer than min_chars beats a cut inside a string
+                else:
+                    end = _soft_cut(text, start + min_c, hard_end, kind)
             else:
                 # best boundary inside the last 30% of the window; else simply the latest one
                 near = start + max(min_c, int((hard_end - start) * 0.7))
@@ -573,6 +669,8 @@ def iter_chunks(text: str, name: str = "text", *, kind: Optional[str] = None, ma
                     if best is None or prios[i] > prios[best]:
                         best = i
                 end = offs[best] if best is not None else offs[hi - 1]
+        if kind in ("json", "jsonish"):
+            end = _escape_safe(text, end, start)
         end = max(end, start + 1)
         if text[start:end].strip():
             yield Chunk(text, start, end, kind)
@@ -886,7 +984,7 @@ class LlamaServerTokenizer:
                 self._cache.move_to_end(key)
                 return self._cache[key]
             if time.monotonic() < self._down_until:
-                return estimate_tokens(text, "python")
+                return estimate_tokens(text, detect_kind(text))
         count: Optional[int] = None
         for i in ([self._backend] if self._backend is not None else range(len(self._BACKENDS))):
             path, fname, rkey = self._BACKENDS[i]
@@ -909,7 +1007,7 @@ class LlamaServerTokenizer:
         if count is None:
             with self._lock:
                 self._down_until = time.monotonic() + self._retry_after
-            return estimate_tokens(text, "python")
+            return estimate_tokens(text, detect_kind(text))
         with self._lock:
             self._cache[key] = count
             while len(self._cache) > self._cache_size:
@@ -1168,6 +1266,16 @@ def _extract_parts(obj: Any) -> Dict[str, Any]:
         v = obj.get(k)
         if isinstance(v, int) and not isinstance(v, bool) and v > 0:
             tim.setdefault(dst, v)
+    # prompt_total = every prompt token the server accounted for, cached ones included.
+    # llama.cpp's timings.prompt_n counts only the tokens it had to evaluate: comparing
+    # THAT with what we sent would flag every KV-cache hit as a truncated prompt.
+    total = None
+    if isinstance(u, dict) and isinstance(u.get("prompt_tokens"), int) and not isinstance(u.get("prompt_tokens"), bool):
+        total = u["prompt_tokens"]
+    elif isinstance(tim.get("prompt_n"), int) and isinstance(tim.get("cache_n"), int):
+        total = tim["prompt_n"] + tim["cache_n"]
+    if total and total > 0:
+        tim["prompt_total"] = total
     pn = tim.get("predicted_n")
     if p["tokens"] is None and isinstance(pn, int) and pn > 0:
         p["tokens"] = pn
@@ -1224,19 +1332,23 @@ class _HTTPFail(Exception):
 # ----------------------------------------------------------------------------
 # Watchdog: total deadline + dead-server detection, aborts by closing the socket
 # ----------------------------------------------------------------------------
-def _close_conn(conn: Any) -> None:
-    if conn is None:
+def _close_conn(conn: Any, sock: Any = None) -> None:
+    """Shut the connection down. ``sock`` must be the raw socket saved at connect time:
+    http.client sets ``conn.sock = None`` as soon as a ``Connection: close`` response
+    starts, so ``conn.sock`` alone cannot interrupt a read that is already blocked."""
+    if conn is None and sock is None:
         return
-    sock = getattr(conn, "sock", None)
+    sock = sock if sock is not None else getattr(conn, "sock", None)
     if sock is not None:
         try:
             sock.shutdown(socket.SHUT_RDWR)
         except (OSError, ValueError):
             pass
-    try:
-        conn.close()
-    except Exception:
-        pass
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1263,15 +1375,18 @@ class _Guard:
         self.reason: Optional[str] = None
         self.t0 = self.last = time.monotonic()
         self._conn: Any = None
+        self.sock: Any = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
-    def attach(self, conn: Any) -> None:
+    def attach(self, conn: Any, sock: Any = None) -> None:
         with self._lock:
             self._conn = conn
+            if sock is not None:
+                self.sock = sock
             dead = self.reason is not None
         if dead:
-            _close_conn(conn)
+            _close_conn(conn, sock)
 
     def touch(self) -> None:
         self.last = time.monotonic()
@@ -1281,9 +1396,9 @@ class _Guard:
             if self.reason:
                 return
             self.reason = reason
-            conn = self._conn
+            conn, sock = self._conn, self.sock
         log.warning("aborting request: %s", reason)
-        _close_conn(conn)
+        _close_conn(conn, sock)
 
     def _loop(self) -> None:
         fails = 0
@@ -1438,6 +1553,7 @@ class _Call:
     stream: bool = True
     on_partial: Optional[Callable[[str], None]] = None
     continua: bool = True
+    continuation_context: str = "auto"      # "full" | "light" | "auto"
 
 
 class LlamaCppClient:
@@ -1529,6 +1645,24 @@ class LlamaCppClient:
         hw = self._hw()
         return {"tps": hw.get("tps"), "prefill_tps": hw.get("prefill_tps"), "n_ctx": self._info()["n_ctx"]}
 
+    def working_budget(self, reserve: int = 512) -> int:
+        """Prompt budget: context minus reserve, capped by the cognitive window.
+        Reads the stored value: asking for a budget must never start a calibration."""
+        n_ctx = int(self._info()["n_ctx"])
+        budget = int(n_ctx * CTX_MARGIN) - max(0, int(reserve))
+        cog = self._cog_stored()
+        if cog:
+            budget = min(budget, int(cog))
+        return max(200, budget)
+
+    def _exact_counts(self) -> bool:
+        """True when prompt sizes come from the server tokenizer, not from the estimate."""
+        tok = self.tokenizer
+        if tok is None or time.monotonic() < getattr(tok, "_down_until", 0.0):
+            return False        # count_exact falls back to the estimate while down
+        return (getattr(tok, "_backend", None) is not None
+                and time.monotonic() >= getattr(tok, "_down_until", 0.0))
+
     def _check_truncation(self, ptoks: int, reply: ChatReply) -> None:
         """Detect a prompt the server cut silently instead of refusing it.
 
@@ -1543,7 +1677,8 @@ class LlamaCppClient:
         real = reply.meta.get("prompt_tokens_real")
         if not isinstance(real, int) or real <= 0 or ptoks <= 0:
             return
-        if real >= ptoks * 0.90:
+        slack = max(16, min(64, ptoks // 10))
+        if real >= ptoks * (0.90 if self._exact_counts() else 0.55) or real >= ptoks - slack:
             return
         reply.meta["prompt_truncated"] = True
         reply.meta["prompt_tokens_sent"] = ptoks
@@ -1680,9 +1815,10 @@ class LlamaCppClient:
                     pass
             return estimate_tokens(s, "text")
 
+        self._prompt_tokens([{"role": "user", "content": "x"}])   # discover the tokenizer FIRST
         half = max(1, (target - 48) // 2)
         reps = max(1, half // max(1, count(unit)))
-        for _ in range(2):
+        for _ in range(4):
             n = count(unit * reps)
             if n <= 0:
                 break
@@ -1701,7 +1837,7 @@ class LlamaCppClient:
         r = self._turn_once(c, msgs, 48, False, None, None, ptoks, None)
         digits = re.sub(r"\D", "", r.text or "")
         log.info("cognitive probe: %d tokens, needle %s, answer %r", ptoks, needle, (r.text or "")[:40])
-        return needle in digits
+        return ptoks if needle in digits else False   # the size ACTUALLY tested, not the target
 
     def _cognitive_limit(self, n_ctx: Optional[int] = None) -> int:
         """Largest prompt this model still handles reliably. Measured once, cached
@@ -1712,6 +1848,13 @@ class LlamaCppClient:
         n_ctx = int(n_ctx or self._info()["n_ctx"])
         ceiling = int(n_ctx * CTX_MARGIN) - 64
         limit = self._COG_FLOOR
+        steps = [t for t in self._COG_STEPS if t <= ceiling]
+        hw = self._hw()
+        pre = hw.get("prefill_tps") or 3.0
+        gen = hw.get("tps") or 3.0
+        eta = sum(t / pre + 48 / gen for t in steps)
+        log.warning("measuring the cognitive window: %d probes, about %.0f min "
+                    "(paid once per model + n_ctx, then read from disk)", len(steps), eta / 60.0)
         with lavoro_atomico(self.base_url):
             for target in self._COG_STEPS:
                 if target > ceiling:
@@ -1727,21 +1870,20 @@ class LlamaCppClient:
                         break
                 if not ok:
                     break
-                limit = target
+                limit = int(ok)
         self._cog_store(limit, n_ctx)
         log.warning("cognitive window: %d tokens (n_ctx=%d, %s)", limit, n_ctx,
                     "measured" if limit > self._COG_FLOOR else "floor: first probe failed")
         return limit
 
-    def working_budget(self, reserve: int = 512) -> int:
-        """Prompt budget: context minus reserve, capped by the cognitive window.
-        Reads the stored value: asking for a budget must never start a calibration."""
-        n_ctx = int(self._info()["n_ctx"])
-        budget = int(n_ctx * CTX_MARGIN) - max(0, int(reserve))
-        cog = self._cog_stored()
-        if cog:
-            budget = min(budget, int(cog))
-        return max(200, budget)
+    def calibra(self) -> int:
+        """Measure the cognitive window NOW, at startup.
+
+        The first prompt above the provisional size would otherwise pay for the
+        calibration inside the request: minutes of silence that look like a hang.
+        Call this once when you start the server; afterwards it reads from disk.
+        """
+        return self._cognitive_limit(int(self._info()["n_ctx"]))
 
     def _plan(self, c: _Call, n_ctx: int, ptoks: int) -> Dict[str, Any]:
         plan = plan_budget(n_ctx, ptoks, max_tokens=c.max_tokens, tps=self._hw().get("tps"),
@@ -1796,6 +1938,8 @@ class LlamaCppClient:
                 d["tool_choice"] = tool_choice
         if c.stream:
             d["stream_options"] = {"include_usage": True}
+        if self.flavor != "openai":
+            d["cache_prompt"] = True            # llama.cpp: reuse the KV cache of the shared prefix
         if thinking is False and self.flavor != "openai":
             d["chat_template_kwargs"] = {"enable_thinking": False}
             d["think"] = False
@@ -1814,7 +1958,7 @@ class LlamaCppClient:
         body = dict(data)
         if not url.endswith("/api/chat"):
             return body
-        for k in ("chat_template_kwargs", "stream_options", "tool_choice"):
+        for k in ("chat_template_kwargs", "stream_options", "tool_choice", "cache_prompt"):
             body.pop(k, None)
         if not body.get("model"):
             info = self._info()
@@ -1847,6 +1991,7 @@ class LlamaCppClient:
             conn = http.client.HTTPConnection(p.hostname, port, timeout=self.connect_timeout)
         guard.attach(conn)
         conn.connect()
+        guard.attach(conn, conn.sock)
         if conn.sock is not None:
             conn.sock.settimeout(None)    # NO read timeout: it would break the buffered reader. Watchdog aborts.
         path = (p.path or "/") + ("?" + p.query if p.query else "")
@@ -1907,8 +2052,8 @@ class LlamaCppClient:
                     self._feed(turn, p, on_partial)
                     if p["finish"]:
                         turn.finish, turn.completed = p["finish"], True
-                        if conn.sock is not None:                 # a closing usage chunk may follow; don't hang on it
-                            conn.sock.settimeout(5.0)
+                        if guard.sock is not None:                # a closing usage chunk may follow; don't hang on it
+                            guard.sock.settimeout(5.0)
                     if turn.chars > self.max_output_chars:
                         turn.finish, turn.completed = "length", True
                         break
@@ -1955,8 +2100,11 @@ class LlamaCppClient:
         r.meta["thinking_truncated"] = trunc
         r.meta["raw_start"] = raw[:200]
         prompt_n = tim.get("prompt_n")
-        if isinstance(prompt_n, int) and prompt_n > 0:
-            r.meta["prompt_tokens_real"] = prompt_n
+        prompt_total = tim.get("prompt_total") or prompt_n
+        if isinstance(prompt_total, int) and prompt_total > 0:
+            r.meta["prompt_tokens_real"] = prompt_total
+        if isinstance(tim.get("cache_n"), int):
+            r.meta["cache_n"] = tim["cache_n"]
         if self.flavor != "openai":
             pf = None
             if (isinstance(tim.get("prompt_per_second"), (int, float)) and (tim.get("prompt_n") or 0) >= 64
@@ -1983,7 +2131,15 @@ class LlamaCppClient:
     def _exchange(self, url: str, data: Dict[str, Any], c: _Call, ptoks: int, max_out: int,
                   on_partial: Optional[Callable[[str], None]]) -> ChatReply:
         body = json.dumps(self._adapt(url, data), ensure_ascii=False).encode("utf-8")
-        guard = _Guard(self._deadline(c, ptoks, max_out), self.idle_limit, self.watchdog_interval,
+        # Silence during prefill is not death: a phone at 5 T/s needs ~400 s for a 2000-token prompt.
+        # Derive the patience from the measured prefill speed (only ever raised; an explicitly
+        # configured idle_limit is always respected).
+        idle = self.idle_limit
+        if idle == type(self).idle_limit:
+            rate = self._hw().get("prefill_tps") or 0
+            if rate > 0:
+                idle = max(idle, min(900.0, 1.5 * ptoks / rate))
+        guard = _Guard(self._deadline(c, ptoks, max_out), idle, self.watchdog_interval,
                        self._probe(), self.max_failures)
         turn, conn = _Turn(), None
         t0 = time.monotonic()
@@ -2010,7 +2166,7 @@ class LlamaCppClient:
                              reply=partial, kind="connection") from exc
         finally:
             guard.stop()
-            _close_conn(conn)
+            _close_conn(conn, guard.sock)
         if guard.reason and not turn.completed:
             raise ModelError("generation aborted: %s" % guard.reason,
                              reply=self._reply_from_turn(turn, c.strip, t0) if turn.events else None, kind="aborted")
@@ -2114,6 +2270,36 @@ class LlamaCppClient:
             reply = self._continue(c, msgs, reply, n_ctx, tools_tokens, meta)
         return reply
 
+    def _continuation_base(self, c: _Call, msgs: List[Dict[str, Any]], first: ChatReply,
+                           n_ctx: int) -> Tuple[List[Dict[str, Any]], str]:
+        """Which messages a continuation turn re-sends in front of the assistant tail.
+
+        full  : the original messages (the server KV cache makes this cheap when it works).
+        light : system messages + the last user message cut to a quarter of the window. Older
+                history is dropped: on a slow device re-reading a long conversation for every
+                continuation turn costs minutes.
+        auto  : light only when the prompt is big AND neither a cache hit nor a fast prefill
+                makes re-sending it cheap.
+        """
+        mode = c.continuation_context
+        if mode == "full":
+            return msgs, "full"
+        if mode == "auto":
+            ptoks = self._prompt_tokens(msgs)
+            pf = self._hw().get("prefill_tps")
+            cheap = (ptoks <= 1500 or (first.meta.get("cache_n") or 0) > 0
+                     or (pf is not None and ptoks / pf <= 15.0))
+            if cheap:
+                return msgs, "full"
+        users = [m for m in msgs if m.get("role") == "user"]
+        if not users:
+            return msgs, "full"
+        cap = int(max(300, int(n_ctx * CTX_MARGIN * 0.25)) * 3.2)
+        text = _as_text(users[-1].get("content"))
+        if len(text) > cap:
+            text = text[: cap // 2] + "\n[...]\n" + text[-(cap // 2):]
+        return [m for m in msgs if m.get("role") == "system"] + [{"role": "user", "content": text}], "light"
+
     def _continue(self, c: _Call, msgs: List[Dict[str, Any]], first: ChatReply, n_ctx: int,
                   tools_tokens: int, meta: Dict[str, Any]) -> ChatReply:
         """Finish a truncated answer. Only the incomplete tail is trimmed and regenerated."""
@@ -2121,16 +2307,18 @@ class LlamaCppClient:
         cur, reasoning = first, first.reasoning
         c2 = replace(c, tools=None, tool_choice=None)
         usable = int(n_ctx * CTX_MARGIN)
+        base_msgs, mode = self._continuation_base(c, msgs, first, n_ctx)
+        meta["continuation_context"] = mode
         while cur.finish_reason == "length" and turns < c.max_turns and tokens < c.max_total_tokens:
             trimmed = _trim_tail(acc)
-            base = self._prompt_tokens(msgs)
+            base = self._prompt_tokens(base_msgs)
             room = usable - base
             if room < 192:
                 meta["continuation_stopped"] = "context"
                 break
-            tail_tokens = max(96, min(1500, int(room * 0.35)))
+            tail_tokens = max(96, min(512, int(room * 0.15)))
             tail = trimmed[-int(tail_tokens * _cpt("text")):]
-            cont_msgs = list(msgs) + [{"role": "assistant", "content": tail},
+            cont_msgs = list(base_msgs) + [{"role": "assistant", "content": tail},
                                       {"role": "user", "content": self.continue_prompt}]
             cptoks = self._prompt_tokens(cont_msgs)
             plan = self._plan(c2, n_ctx, cptoks)
@@ -2147,6 +2335,11 @@ class LlamaCppClient:
             finally:
                 if hb:
                     hb.close()
+            if nxt.meta.get("prompt_truncated"):
+                meta["prompt_truncated"] = True
+                meta["continuation_truncated"] = meta.get("continuation_truncated", 0) + 1
+                log.warning("a continuation turn had its prompt cut: stopping")
+                break
             new = nxt.text
             if len(new) >= 60 and new[:60] in acc[:600]:
                 meta["continuation_stopped"] = "restart"        # the model started over: keep what we have
@@ -2165,6 +2358,8 @@ class LlamaCppClient:
             meta["truncated"] = True
         out = ChatReply(acc, reasoning, first.tool_calls, cur.finish_reason, first.ttft, cur.tps or first.tps, tokens)
         out.meta.update(first.meta)
+        if meta.get("prompt_truncated"):
+            out.meta["prompt_truncated"] = True
         return out
 
     def _ensure_action(self, c: _Call, msgs: List[Dict[str, Any]], reply: ChatReply, force_action: bool,
@@ -2268,14 +2463,36 @@ class LlamaCppClient:
             text = text[: keep // 2] + "\n[...]\n" + text[-(keep // 2):]
         return text
 
+    def _drop_old_history(self, msgs: List[Dict[str, Any]], budget: int, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Drop the OLDEST non-system messages until the conversation fits ``budget`` tokens.
+
+        The last message is never dropped. Cheaper and safer than summarising: nothing is invented.
+        """
+        cost = self._prompt_tokens
+        out = list(msgs)
+        dropped = 0
+        while cost(out) > budget:
+            first = next((i for i, m in enumerate(out[:-1]) if m.get("role") != "system"), None)
+            if first is None:
+                break
+            del out[first]
+            dropped += 1
+        if dropped:
+            meta["history_dropped"] = dropped
+            log.warning("dropped the %d oldest message(s) to fit the context", dropped)
+        return out
+
     def _reduce_messages(self, msgs: List[Dict[str, Any]], budget: int, question: Optional[str],
                          meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+        msgs = self._drop_old_history(msgs, budget, meta)
         idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
         if not idxs:
             return msgs
+        if self._prompt_tokens(msgs) <= budget:
+            return msgs
         big = max(idxs, key=lambda i: len(_as_text(msgs[i].get("content"))))
         text = _as_text(msgs[big].get("content"))
-        others = sum(estimate_tokens(_as_text(m.get("content"))) + 8 for i, m in enumerate(msgs) if i != big)
+        others = self._prompt_tokens([m for i, m in enumerate(msgs) if i != big])
         target = max(200, budget - others)
         if question:
             core, tail = text, "\n\nRequest: " + question
@@ -2292,7 +2509,7 @@ class LlamaCppClient:
         return out
 
     # -- public API ----------------------------------------------------------
-    def _spill(self, reply) -> None:
+    def _spill(self, reply: ChatReply) -> None:
         """Write a long answer to disk so the caller can hold a path, not the text.
 
         Opt-in: BOCCONCINI_SPILL_CHARS (absent or 0 = off), BOCCONCINI_SPILL_DIR.
@@ -2305,26 +2522,21 @@ class LlamaCppClient:
         if limit <= 0 or not reply.text or len(reply.text) < limit:
             return
         try:
-            from pathlib import Path as _P
-            import hashlib as _h
             env = os.environ.get("BOCCONCINI_SPILL_DIR")
             if env:
-                folder = _P(env).expanduser()
+                folder = Path(env).expanduser()
             else:
                 prof = _profile_path()
-                folder = (prof.parent if prof is not None else _P.home() / ".cache" / "bocconcini") / "spill"
+                folder = (prof.parent if prof is not None else Path.home() / ".cache" / "bocconcini") / "spill"
             folder.mkdir(parents=True, exist_ok=True)
-            tag = _h.blake2b(reply.text.encode("utf-8", "replace"), digest_size=4).hexdigest()
+            tag = hashlib.blake2b(reply.text.encode("utf-8", "replace"), digest_size=4).hexdigest()
             name = "spill_%s_%d_%s.txt" % (time.strftime("%Y%m%d_%H%M%S"), os.getpid(), tag)
             target, tmp = folder / name, folder / (name + ".tmp")
             tmp.write_text(reply.text, encoding="utf-8")
             os.replace(str(tmp), str(target))
             reply.meta["spill_path"] = str(target)
             reply.meta["spill_chars"] = len(reply.text)
-            try:
-                reply.spill_path = str(target)
-            except Exception:
-                pass                      # frozen dataclass: meta already carries it
+            reply.spill_path = str(target)
             log.info("answer spilled to %s (%d chars)", target, len(reply.text))
         except Exception as exc:
             log.warning("cannot spill the answer (%s): keeping it in memory", exc)
@@ -2338,6 +2550,7 @@ class LlamaCppClient:
                   on_partial: Optional[Callable[[str], None]] = None, blocca_altri: bool = True,
                   timeout_attesa: Optional[float] = None, tool_choice: Any = None,
                   max_total_tokens: int = DEFAULT_MAX_TOTAL_TOKENS, max_turns: int = DEFAULT_MAX_TURNS,
+                  continuation_context: str = "auto",
                   action_validator: Optional[Callable[[ChatReply], bool]] = None, act_retries: int = 1,
                   reduce_question: Optional[str] = None) -> ChatReply:
         """One chat request with budgeting, continuation and action enforcement.
@@ -2360,7 +2573,8 @@ class LlamaCppClient:
             else:
                 msgs.insert(0, {"role": "system", "content": self.action_hint})
         c = _Call(msgs, temperature, tools, tool_choice, max_tokens, max_total_tokens, max_turns, thinking,
-                  bool(strip_thinking), extra, timeout, bool(stream), on_partial, continua)
+                  bool(strip_thinking), extra, timeout, bool(stream), on_partial, continua,
+                  continuation_context)
         with lavoro_atomico(self.base_url, blocca_altri=blocca_altri, timeout_attesa=timeout_attesa):
             reply = self._run(c, force_action, action_validator, act_retries, auto_reduce, reduce_question)
         self._spill(reply)
