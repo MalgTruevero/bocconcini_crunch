@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bocconcini"
+version = "4.3.0"
+description = "Local LLM client for small usable windows. Zero runtime dependencies."
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [{name = "Grasso Maurizio"}]
+dependencies = []
+
+[tool.setuptools]
+py-modules = ["bocconcini", "bocconcini_tree"]

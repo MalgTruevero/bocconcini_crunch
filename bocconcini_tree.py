@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__all__ = ["DocNode", "DocTree", "TreeError", "etichetta", "naviga", "albero_codice"]
+__all__ = ["DocNode", "DocTree", "TreeError", "etichetta", "naviga", "albero_codice", "trova_fatti"]
 _MAX_BACKUPS = 50
 _DIARY_KEEP = 500
 _ZIP_ABOVE = 100
@@ -595,3 +595,42 @@ def _filtra_chiama(roots: List[DocNode]) -> None:
                 txt += " (+%d altri)" % (len(useful) - len(shown))
             parts.append(txt)
         n.summary = "; ".join(parts)[:200]
+
+_FATTO = (
+    ("codice", re.compile(r"\b[A-Z][A-Z0-9]{2,}[-_][A-Z0-9]{1,8}\b")),
+    ("sigla", re.compile(r"\b[A-Z]{3,}\d{1,6}\b")),
+    ("misura", re.compile(r"\b\d+(?:[.,]\d+)?\s?(?:terawatt|gigawatt|megawatt|kilowatt|watt|TB|GB|MB|GHz|MHz|volt|ampere)\b", re.I)),
+    ("chiave", re.compile(r"\b[A-Za-z0-9_\-]{16,}\b")),
+    ("virgolette", re.compile(r'"([^"\n]{3,60})"')),
+)
+
+
+def trova_fatti(testo: str, max_per_tipo: int = 40, contesto: int = 90) -> List[Dict[str, Any]]:
+    """Exhaustive deterministic scan for candidate FACTS, with their context.
+
+    Python reads EVERY character (cheap, lossless) and hands the model a small
+    candidate set to judge: nothing is compressed, nothing is dropped in silence.
+    Each hit carries its position and the words around it, so a fact can be
+    matched to a question -- and verified -- without reading the document.
+    """
+    testo = testo or ""
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for tipo, rx in _FATTO:
+        n = 0
+        for m in rx.finditer(testo):
+            v = (m.group(1) if m.groups() else m.group(0)).strip()
+            if not v or (tipo, v) in seen:
+                continue
+            if tipo == "chiave" and not (any(c.isdigit() for c in v) and any(c.isalpha() for c in v)):
+                continue                      # an API key mixes letters and digits; a long word does not
+            seen.add((tipo, v))
+            a, b = max(0, m.start() - contesto), min(len(testo), m.end() + 40)
+            out.append({"tipo": tipo, "valore": v, "pos": m.start(),
+                        "percentuale": round(100.0 * m.start() / max(1, len(testo)), 1),
+                        "contesto": " ".join(testo[a:b].split())})
+            n += 1
+            if n >= max_per_tipo:
+                break
+    out.sort(key=lambda d: d["pos"])
+    return out

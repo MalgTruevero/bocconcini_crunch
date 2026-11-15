@@ -1,10 +1,10 @@
-"""bocconcini 4.0 - split text/Python/JSON into LLM-sized chunks and talk to a
+"""bocconcini 4.3 - split text/Python/JSON into LLM-sized chunks and talk to a
 local llama.cpp / KoboldCpp / Ollama / OpenAI-compatible server.
 
 Standard library only, Python >= 3.7, thread-safe. Born on a Samsung S20 Ultra
 (Termux) and meant to scale up to a normal PC: nothing here is hard-wired to the phone.
 
-What is new in 4.0 (see CHANGELOG at the bottom of this docstring)
+Main features
   * Output budget comes from the context window, NOT from generation speed.
     Speed (measured tokens/s) only drives timeouts and the optional ``target_seconds``.
   * Answers longer than one turn are finished by tail-continuation: only the
@@ -22,6 +22,30 @@ Chunking guarantees
   * JSON is cut outside strings; prose at paragraph > line > sentence > whitespace.
 
 Android/Termux: call from a worker thread, never from the UI thread.
+
+Reference setup (where it was developed and checked by hand): Samsung Galaxy S20 Ultra, Termux,
+KoboldCpp, chat model smol-tools-4b-16k-q4_k_m.gguf, embedding model Qwen3-Embedding-0.6B-Q8_0.gguf.
+The automated tests use a fake HTTP server; llama.cpp, Ollama and cloud paths are NOT verified live.
+
+Small context windows
+  * Nothing can exceed the model window: a 15000-character text does not fit a 2048-token model.
+    With ``auto_reduce=True`` the prompt is shrunk to fit (oldest history dropped first, then the
+    biggest message is reduced by the model or locally); for a real document pipeline, split it
+    yourself with ``iter_chunks_adaptive`` and combine the answers.
+  * Optional "cognitive window": ``client.calibra()`` (minutes on a phone, run it once, on purpose)
+    finds the largest prompt at which the model still retrieves a hidden code; it is stored next to
+    the hardware profile and later prompts are shrunk to it. Only a PASSED test is stored; an
+    inconclusive one changes nothing. You can set it by hand: ``cognitive_limit=`` or
+    BOCCONCINI_COGNITIVE_LIMIT; BOCCONCINI_NO_COGNITIVE=1 ignores it.
+
+CHANGELOG 4.3.0 (changes to the 4.2.0 file; checked against a fake server, not a live one)
+  * The cognitive window is never measured inside a request any more (it blocked the first big
+    request for minutes) and a failed first probe is no longer stored as a 256-token floor that
+    then rejected nearly every prompt. Prompts above the limit are reduced, not refused
+    (``cognitive_overflow`` only when reduction is off or fails). Finer probe steps, so a 2048
+    window is no longer tested at 512 and 1024 only; thinking off and a tolerant answer check.
+  * Restored the 4.0.2 fixes that 4.2.0 had lost: see CHANGELOG 4.0.2 below.
+  * The module ``bocconcini_docs`` named in 4.1.0 is not part of this package.
 
 CHANGELOG 4.2.0
   * JSON no longer torn apart: the old boundary scan capped depth at 2 above 500 KB and gave up
@@ -43,7 +67,7 @@ CHANGELOG 4.1.0
     ``cache_prompt`` for llama.cpp. Too-long histories are trimmed oldest-first before any message
     content is reduced.
   * Tokenizer fallback uses the same estimate as everywhere else (was 14% too pessimistic).
-  * ``working_budget()`` for document pipelines; see the companion module bocconcini_docs.
+  * ``working_budget()`` for document pipelines.
 
 CHANGELOG 4.0.1
   Fixed (verified on KoboldCpp, Samsung S20 Ultra / Termux):
@@ -72,6 +96,28 @@ CHANGELOG 4.0.1
   NOT verified in the field: the Ollama code paths and the cloud context harvest.
   llama.cpp paths are exercised by the same code but were not run on a live
   llama-server. Contributions with test output welcome.
+
+CHANGELOG 4.0.2 (checked against a fake server, not a live one)
+  Fixed:
+    * a watchdog abort could surface as a raw AttributeError (http.client closes
+      the response under the reading thread); it is now a ModelError(kind="aborted")
+      and a reply that was already complete is returned instead of discarded.
+    * "prompt truncated" false alarms: llama.cpp reports in timings.prompt_n only
+      the tokens it evaluated (the rest came from its cache), so the TOTAL is now
+      taken from usage.prompt_tokens; and the check (and the template-overhead
+      learning) only runs when our own count was exact, never when it was an estimate.
+    * LlamaServerTokenizer.try_count() returns None instead of an estimate when no
+      backend answers; a non-JSON 200 on /tokenize falls through to KoboldCpp's endpoint.
+    * estimate_tokens counts every non-ASCII character as at least one token again.
+    * invia_adattivo(verifica_esatta=True) now re-splits when the server counts more
+      tokens than estimated (it only logged a warning before) and counts one chunk, not all
+      (verifica_tutti=True counts every chunk).
+    * continuation: a model that repeated the end of its text was mistaken for one that
+      restarted from the top whenever the answer was shorter than 600 characters, and the
+      continuation was thrown away. A restart is now only a continuation that begins with
+      the first 60 characters of the answer.
+    * continua defaults to off for OpenAICompatClient (it would spend money); an answer
+      that is still cut gets reply.meta["truncated"] = True whether or not continuation ran.
 """
 from __future__ import annotations
 
@@ -100,7 +146,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-__version__ = "4.2.0"
+__version__ = "4.3.0"
 __all__ = [
     "Chunk", "ChatReply", "ModelError", "TokenCounter", "TokenCounterLike",
     "estimate_tokens", "detect_kind", "iter_chunks", "split_text", "split_thinking", "strip_thinking",
@@ -117,6 +163,13 @@ __all__ = [
 
 log = logging.getLogger("bocconcini")
 TokenCounterLike = Callable[[str], int]
+
+def _env_int(name: str) -> int:
+    try:
+        return int(os.environ.get(name) or 0)
+    except ValueError:
+        return 0
+
 
 DEFAULT_BASE_URL = os.environ.get("BOCCONCINI_BASE_URL", "http://127.0.0.1:8082")
 FALLBACK_N_CTX = 4096
@@ -229,8 +282,12 @@ def _cpt(kind: str) -> float:
 
 
 def estimate_tokens(text: Any, kind: str = "text") -> int:
+    """Pessimistic: ASCII at ``_cpt`` chars/token, every other character as one token (CJK, emoji)."""
     s = _as_text(text)
-    return int(len(s) / _cpt(kind)) + 1 if s else 0
+    if not s:
+        return 0
+    ascii_chars = len(s.encode("ascii", "ignore"))
+    return int(ascii_chars / _cpt(kind) + (len(s) - ascii_chars)) + 1
 
 
 def _count(text: str, kind: str, counter: Optional[Any]) -> int:
@@ -944,7 +1001,15 @@ def calcola_spazio_rimasto(prompt_base: str, base_url: str = DEFAULT_BASE_URL, m
     """Tokens per chunk that fit next to ``prompt_base`` in the model context."""
     info = get_model_info(base_url, n_ctx=n_ctx)
     n = info["n_ctx"]
-    base_tok = _count(prompt_base, kind, token_counter)
+    base_tok: Optional[int] = None
+    exact = getattr(token_counter, "try_count", None)
+    if exact is not None:
+        try:
+            base_tok = exact(prompt_base)
+        except Exception:
+            base_tok = None
+    if base_tok is None:
+        base_tok = _count(prompt_base, kind, token_counter)
     raw = int(n * margine_sicurezza) - base_tok - riserva_risposta
     ok = raw >= 200
     if not ok:
@@ -975,7 +1040,8 @@ class LlamaServerTokenizer:
         self._down_until = 0.0
         self._lock = threading.Lock()
 
-    def count_exact(self, text: str) -> int:
+    def try_count(self, text: str) -> Optional[int]:
+        """Exact count, or ``None`` when no backend answers (never an estimate)."""
         if not text:
             return 0
         key = hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).hexdigest()
@@ -984,13 +1050,13 @@ class LlamaServerTokenizer:
                 self._cache.move_to_end(key)
                 return self._cache[key]
             if time.monotonic() < self._down_until:
-                return estimate_tokens(text, detect_kind(text))
+                return None
         count: Optional[int] = None
         for i in ([self._backend] if self._backend is not None else range(len(self._BACKENDS))):
             path, fname, rkey = self._BACKENDS[i]
             try:
                 reply = _http_json(self._base + path, {fname: text}, timeout=self._timeout)
-            except urllib.error.HTTPError:
+            except (urllib.error.HTTPError, ValueError):
                 continue
             except Exception as exc:
                 log.debug("tokenizer unreachable: %s", exc)
@@ -1007,12 +1073,17 @@ class LlamaServerTokenizer:
         if count is None:
             with self._lock:
                 self._down_until = time.monotonic() + self._retry_after
-            return estimate_tokens(text, detect_kind(text))
+            return None
         with self._lock:
             self._cache[key] = count
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
         return count
+
+    def count_exact(self, text: str) -> int:
+        """Like :meth:`try_count`, but falls back to the pessimistic estimate."""
+        n = self.try_count(text)
+        return estimate_tokens(text, detect_kind(text)) if n is None else n
 
     def __call__(self, text: str) -> int:
         return self.count_exact(text)
@@ -1585,8 +1656,10 @@ class LlamaCppClient:
                  server_pid_file: Optional[str] = None, target_seconds: Optional[float] = None,
                  idle_limit: Optional[float] = None, modalita_tartaruga: bool = False,
                  tokenizer: Optional[Any] = None, verify_tls: bool = True, auto_reduce_mode: str = "auto",
-                 **_ignored: Any) -> None:
+                 cognitive_limit: Optional[int] = None, **_ignored: Any) -> None:
         self.base_url = _check_base_url(base_url)
+        if _ignored:
+            log.warning("ignored arguments: %s", ", ".join(sorted(_ignored)))
         if api_key and self.base_url.startswith("http://") and not _is_local(self.base_url):
             raise ValueError("refusing to send an api_key over plain http to a remote host")
         self.model, self.timeout, self.api_key = model, timeout, api_key
@@ -1594,6 +1667,7 @@ class LlamaCppClient:
         self.n_ctx, self.auto_reduce, self.auto_max_tokens = n_ctx, auto_reduce, auto_max_tokens
         self.persist_profile, self.target_seconds = persist_profile, target_seconds
         self.tokenizer, self.verify_tls, self.auto_reduce_mode = tokenizer, verify_tls, auto_reduce_mode
+        self.cognitive_limit = int(cognitive_limit) if cognitive_limit else None
         self.modalita_tartaruga = bool(modalita_tartaruga) or os.environ.get("BOCCONCINI_NO_TIMEOUT") == "1"
         if idle_limit is not None:
             self.idle_limit = float(idle_limit)
@@ -1642,8 +1716,9 @@ class LlamaCppClient:
 
     def stats(self) -> Dict[str, Any]:
         """Learned speed (tokens/s) and the n_ctx currently assumed."""
+        n_ctx = self._info()["n_ctx"]                 # first: it learns the model name used as profile key
         hw = self._hw()
-        return {"tps": hw.get("tps"), "prefill_tps": hw.get("prefill_tps"), "n_ctx": self._info()["n_ctx"]}
+        return {"tps": hw.get("tps"), "prefill_tps": hw.get("prefill_tps"), "n_ctx": n_ctx}
 
     def working_budget(self, reserve: int = 512) -> int:
         """Prompt budget: context minus reserve, capped by the cognitive window.
@@ -1699,28 +1774,22 @@ class LlamaCppClient:
         difference is the chat template, learned per message and persisted.
         """
         real = reply.meta.get("prompt_tokens_real")
-        if not isinstance(real, int) or real <= 0 or self.tokenizer is None:
+        if not isinstance(real, int) or real <= 0:
             return
         text = "\n".join(_as_text(m.get("content")) for m in msgs)
         if not text:
             return
-        try:
-            fn = getattr(self.tokenizer, "count_exact", None) or self.tokenizer
-            content = int(fn(text))
-        except Exception:
+        content = self._exact_content(text)
+        if content is None:                     # never learn the template from an estimate
             return
         tt = estimate_tokens(json.dumps(tools, ensure_ascii=False), "json") if tools else 0
         per_msg = (real - content - tt) / max(1, len(msgs))
         if 1.0 <= per_msg <= 64.0:
             profile_update(self._hw_key(), overhead=per_msg, persist=self.persist_profile)
 
-    def _prompt_tokens(self, msgs: List[Dict[str, Any]], tools_tokens: int = 0) -> int:
-        """Exact content count when the server offers a tokenizer, plus the learned
-        template overhead. The tokenizer is discovered lazily on local servers only
-        (a cloud /tokenize would upload the whole prompt for nothing); its
-        ``_is_remote`` flag keeps it out of the chunking hot loop.
-        """
-        text = "\n".join(_as_text(m.get("content")) for m in msgs)
+    def _get_tokenizer(self) -> Optional[Any]:
+        """The server tokenizer, discovered lazily on local servers only (a cloud
+        /tokenize would upload the whole prompt for nothing)."""
         if (self.tokenizer is None and self.flavor != "openai"
                 and not getattr(self, "_tok_tried", False)):
             self._tok_tried = True
@@ -1728,24 +1797,35 @@ class LlamaCppClient:
                 self.tokenizer = LlamaServerTokenizer(self.base_url)
             except Exception as exc:
                 log.debug("no tokenizer available: %s", exc)
-        n: Optional[int] = None
-        if self.tokenizer is not None:
-            try:
-                fn = getattr(self.tokenizer, "count_exact", None) or self.tokenizer
-                n = int(fn(text))
-            except Exception:
-                n = None
+        return self.tokenizer
+
+    def _exact_content(self, text: str) -> Optional[int]:
+        """Exact token count of ``text`` from the server tokenizer, or None."""
+        tok = self._get_tokenizer()
+        if tok is None:
+            return None
+        try:
+            fn = getattr(tok, "try_count", None)
+            n = fn(text) if fn is not None else tok(text)
+            return None if n is None else int(n)
+        except Exception:
+            return None
+
+    def _prompt_tokens(self, msgs: List[Dict[str, Any]], tools_tokens: int = 0) -> int:
+        """Exact content count when the server has a tokenizer (else a pessimistic
+        estimate) plus the learned chat-template overhead per message."""
+        text = "\n".join(_as_text(m.get("content")) for m in msgs)
+        n = self._exact_content(text)
         if n is None:
             n = estimate_tokens(text, detect_kind(text))
         per_msg = self._hw().get("msg_overhead") or 8.0
         return n + int(per_msg * len(msgs)) + tools_tokens
+
     # -- cognitive window ----------------------------------------------------
     # Nominal n_ctx is not the usable window: a small model can hold 4096 tokens
     # and still lose the thread at 1500. Nothing else here can see it: the server
     # processes every token, no error is raised, the answer is simply wrong.
-    _COG_FLOOR = 256
-    _COG_PROVISIONAL = 512
-    _COG_STEPS = (512, 1024, 2048, 4096, 8192)
+    _COG_STEPS = (512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
 
     _COG_LOCK = threading.Lock()
 
@@ -1771,6 +1851,9 @@ class LlamaCppClient:
         the moment, and it costs minutes to measure. Speed measurements live in the
         hardware profile and legitimately expire; this must not.
         """
+        forced = self.cognitive_limit or _env_int("BOCCONCINI_COGNITIVE_LIMIT")
+        if forced and forced > 0:
+            return int(forced)
         n_ctx = int(self._info()["n_ctx"])
         with self._COG_LOCK:
             e = self._cog_read().get(self._hw_key())
@@ -1788,9 +1871,7 @@ class LlamaCppClient:
             return
         with self._COG_LOCK:
             entries = self._cog_read()
-            entries[self._hw_key()] = {"limit": int(limit), "n_ctx": int(n_ctx),
-                                       "measured": bool(limit > self._COG_FLOOR),
-                                       "ts": time.time()}
+            entries[self._hw_key()] = {"limit": int(limit), "n_ctx": int(n_ctx), "ts": time.time()}
             try:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 tmp = p.with_name(p.name + ".tmp.%d" % os.getpid())
@@ -1839,55 +1920,62 @@ class LlamaCppClient:
         ptoks = self._prompt_tokens(msgs)
         if ptoks > int(n_ctx * CTX_MARGIN) - 32:
             return None
-        c = _Call(msgs, temperature=0.0, max_tokens=48, continua=False, stream=False)
-        r = self._turn_once(c, msgs, 48, False, None, None, ptoks, None)
-        digits = re.sub(r"\D", "", r.text or "")
+        c = _Call(msgs, temperature=0.0, max_tokens=96, thinking=False, continua=False, stream=False)
+        r = self._turn_once(c, msgs, 96, False, None, None, ptoks, None)
+        answer = (r.text or "") + " " + (r.reasoning or "")
         log.info("cognitive probe: %d tokens, needle %s, answer %r", ptoks, needle, (r.text or "")[:40])
-        return ptoks if needle in digits else False   # the size ACTUALLY tested, not the target
+        return ptoks if needle in re.sub(r"[\s.,'\-]", "", answer) else False   # the size ACTUALLY tested, not the target
 
     def _cognitive_limit(self, n_ctx: Optional[int] = None) -> int:
-        """Largest prompt this model still handles reliably. Measured once, cached
-        in the hardware profile, invalidated when n_ctx changes."""
+        """Largest prompt size this model passed the needle test at (0 = unknown).
+
+        Only a PASSED probe is stored. A failed first probe proves nothing (template,
+        language, a busy server): it is reported and measured again next time, it never
+        becomes a limit that shrinks every later request.
+        """
         stored = self._cog_stored()
         if stored:
             return stored
         n_ctx = int(n_ctx or self._info()["n_ctx"])
-        ceiling = int(n_ctx * CTX_MARGIN) - 64
-        limit = self._COG_FLOOR
+        ceiling = int(n_ctx * CTX_MARGIN) - 96
         steps = [t for t in self._COG_STEPS if t <= ceiling]
+        if ceiling > 256 and (not steps or steps[-1] < ceiling * 0.85):
+            steps.append(ceiling)
         hw = self._hw()
-        pre = hw.get("prefill_tps") or 3.0
-        gen = hw.get("tps") or 3.0
-        eta = sum(t / pre + 48 / gen for t in steps)
-        log.warning("measuring the cognitive window: %d probes, about %.0f min "
-                    "(paid once per model + n_ctx, then read from disk)", len(steps), eta / 60.0)
+        pre, gen = hw.get("prefill_tps") or 3.0, hw.get("tps") or 3.0
+        log.warning("measuring the cognitive window: up to %d probes, about %.0f min "
+                    "(once per model + n_ctx, then read from disk)",
+                    len(steps), sum(t / pre + 96 / gen for t in steps) / 60.0)
+        limit, failed = 0, False
         with lavoro_atomico(self.base_url):
-            for target in self._COG_STEPS:
-                if target > ceiling:
-                    break
-                ok = None
+            for target in steps:
+                ok: Any = None
                 for _try in range(2):
                     try:
                         ok = self._cog_probe(target, n_ctx)
                     except ModelError as exc:
                         log.warning("cognitive probe at %d failed: %s", target, exc)
-                        ok = False
+                        ok = None
                     if ok:
                         break
                 if not ok:
+                    failed = ok is False or ok is None
                     break
                 limit = int(ok)
-        self._cog_store(limit, n_ctx)
-        log.warning("cognitive window: %d tokens (n_ctx=%d, %s)", limit, n_ctx,
-                    "measured" if limit > self._COG_FLOOR else "floor: first probe failed")
+        if limit:
+            self._cog_store(limit, n_ctx)
+            log.warning("cognitive window: %d tokens (n_ctx=%d)", limit, n_ctx)
+        else:
+            log.warning("cognitive window: inconclusive%s: nothing stored, no limit applied",
+                        " (the first probe failed)" if failed else "")
         return limit
 
     def calibra(self) -> int:
-        """Measure the cognitive window NOW, at startup.
+        """Measure the cognitive window NOW (minutes on a phone). Never called implicitly.
 
-        The first prompt above the provisional size would otherwise pay for the
-        calibration inside the request: minutes of silence that look like a hang.
-        Call this once when you start the server; afterwards it reads from disk.
+        Returns the size in tokens, or 0 when the test was inconclusive. Afterwards the value
+        is read from disk and ``chat_full`` shrinks bigger prompts to it (auto_reduce) instead
+        of sending them. Set it by hand with ``cognitive_limit=`` or BOCCONCINI_COGNITIVE_LIMIT.
         """
         return self._cognitive_limit(int(self._info()["n_ctx"]))
 
@@ -2162,14 +2250,20 @@ class LlamaCppClient:
             if exc.reply is None and turn.events:
                 exc.reply = self._reply_from_turn(turn, c.strip, t0)
             raise
-        except (OSError, http.client.HTTPException, ValueError) as exc:
+        except Exception as exc:
+            # http.client may raise AttributeError/TypeError when the watchdog closes the
+            # response under the reading thread, so every failure is classified here.
+            if turn.completed:
+                return self._reply_from_turn(turn, c.strip, t0)
             partial = self._reply_from_turn(turn, c.strip, t0) if turn.events else None
             if guard.reason:
                 raise ModelError("generation aborted: %s" % guard.reason, reply=partial, kind="aborted") from exc
             if isinstance(exc, ValueError):
                 raise ModelError("invalid response from %s: %s" % (url, exc), reply=partial, kind="protocol") from exc
-            raise ModelError("connection lost at %s after %.0fs: %s" % (url, time.monotonic() - t0, exc),
-                             reply=partial, kind="connection") from exc
+            if isinstance(exc, (OSError, http.client.HTTPException)):
+                raise ModelError("connection lost at %s after %.0fs: %s" % (url, time.monotonic() - t0, exc),
+                                 reply=partial, kind="connection") from exc
+            raise
         finally:
             guard.stop()
             _close_conn(conn, guard.sock)
@@ -2238,7 +2332,8 @@ class LlamaCppClient:
                                      kind=kind) from exc
                 self._url_ok = url
                 try:
-                    self._check_truncation(ptoks, reply)
+                    exact = self._exact_content("\n".join(_as_text(m.get("content")) for m in msgs)) is not None
+                    self._check_truncation(ptoks if exact else 0, reply)   # an estimate proves nothing
                     if not reply.meta.get("prompt_truncated"):
                         self._calibrate(msgs, reply, tools)
                 except Exception as exc:
@@ -2347,7 +2442,7 @@ class LlamaCppClient:
                 log.warning("a continuation turn had its prompt cut: stopping")
                 break
             new = nxt.text
-            if len(new) >= 60 and new[:60] in acc[:600]:
+            if len(new) >= 60 and len(acc) >= 120 and new.lstrip()[:60] == acc.lstrip()[:60]:
                 meta["continuation_stopped"] = "restart"        # the model started over: keep what we have
                 break
             piece = _stitch(trimmed, new)
@@ -2491,8 +2586,16 @@ class LlamaCppClient:
     def _reduce_messages(self, msgs: List[Dict[str, Any]], budget: int, question: Optional[str],
                          meta: Dict[str, Any]) -> List[Dict[str, Any]]:
         msgs = self._drop_old_history(msgs, budget, meta)
-        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        # The LAST message is the REQUEST, not data. Compressing it turns a
+        # question into a mutilated fragment, and the model then answers about
+        # the cut instead of about what was asked. Only a document pipeline
+        # (which passes reduce_question) may reduce it.
+        last = len(msgs) - 1
+        idxs = [i for i, m in enumerate(msgs)
+                if m.get("role") != "system" and (question or i != last)]
         if not idxs:
+            meta["reduce_skipped"] = "only the request would be reducible"
+            log.warning("nothing to reduce except the request: refusing to mangle it")
             return msgs
         if self._prompt_tokens(msgs) <= budget:
             return msgs
@@ -2552,7 +2655,7 @@ class LlamaCppClient:
                   tools: Optional[List[Dict[str, Any]]] = None, max_tokens: Optional[int] = None,
                   thinking: Optional[bool] = None, strip_thinking: bool = True, force_action: bool = False,
                   extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, stream: bool = True,
-                  auto_reduce: Optional[bool] = None, continua: bool = True,
+                  auto_reduce: Optional[bool] = None, continua: Optional[bool] = None,
                   on_partial: Optional[Callable[[str], None]] = None, blocca_altri: bool = True,
                   timeout_attesa: Optional[float] = None, tool_choice: Any = None,
                   max_total_tokens: int = DEFAULT_MAX_TOTAL_TOKENS, max_turns: int = DEFAULT_MAX_TURNS,
@@ -2562,6 +2665,8 @@ class LlamaCppClient:
         """One chat request with budgeting, continuation and action enforcement.
 
         ``max_tokens`` caps ONE turn; ``max_total_tokens``/``max_turns`` cap the continuation.
+        ``continua``: finish an answer cut by the token limit (default: on for local servers, off for
+        OpenAICompatClient). A still-truncated answer is returned with ``reply.meta["truncated"] = True``.
         ``force_action``: the model must act (tool call). Uses tool_choice=required when ``tools``
         are given, parses text tool calls, and nudges once. ``action_validator(reply)->bool`` lets
         you define "acted" for your own text protocol. ``on_partial`` receives live text deltas
@@ -2578,8 +2683,9 @@ class LlamaCppClient:
                 msgs[0]["content"] = _as_text(msgs[0].get("content")) + "\n\n" + self.action_hint
             else:
                 msgs.insert(0, {"role": "system", "content": self.action_hint})
+        cont = (self.flavor != "openai") if continua is None else bool(continua)
         c = _Call(msgs, temperature, tools, tool_choice, max_tokens, max_total_tokens, max_turns, thinking,
-                  bool(strip_thinking), extra, timeout, bool(stream), on_partial, continua,
+                  bool(strip_thinking), extra, timeout, bool(stream), on_partial, cont,
                   continuation_context)
         with lavoro_atomico(self.base_url, blocca_altri=blocca_altri, timeout_attesa=timeout_attesa):
             reply = self._run(c, force_action, action_validator, act_retries, auto_reduce, reduce_question)
@@ -2613,24 +2719,23 @@ class LlamaCppClient:
             reserve = min(max(c.max_tokens or 1024, 512), plan["usable"] // 2)
             msgs = self._reduce_messages(msgs, plan["usable"] - reserve - tools_tokens, reduce_question, meta)
             plan = self._plan(c, n_ctx, self._prompt_tokens(msgs, tools_tokens))
-        # The nominal window is not the usable one: a small model can hold every
-        # token and still lose the thread. Nothing else here can see it, because
-        # the server raises no error and the answer is simply wrong. Above the
-        # provisional size we consult the measured window (cached, one calibration
-        # per model + n_ctx). Refusing is the point: better late than wrong.
-        ptoks_now = plan["usable"] - plan["free"]
-        cog = 0
-        if (os.environ.get("BOCCONCINI_NO_COGNITIVE") != "1"
-                and ptoks_now > self._COG_PROVISIONAL):
-            cog = self._cognitive_limit(n_ctx)
+        # The nominal window is not always the usable one: a small model can hold every token
+        # and still lose the thread. A limit that was measured (calibra()) or set by hand is
+        # applied here; it is never measured implicitly, so a request never waits for a test.
+        cog = 0 if os.environ.get("BOCCONCINI_NO_COGNITIVE") == "1" else (self._cog_stored() or 0)
         if cog:
             meta["cognitive_limit"] = cog
-            if ptoks_now > cog:
-                raise ModelError(
-                    "the prompt (~%d tokens) fits n_ctx=%d but exceeds this model\'s "
-                    "measured cognitive window (%d tokens): the answer would not be "
-                    "reliable. Split the task into smaller pieces." % (ptoks_now, n_ctx, cog),
-                    kind="cognitive_overflow")
+            now = plan["usable"] - plan["free"]
+            if now > cog:
+                if reduce_on:
+                    msgs = self._reduce_messages(msgs, cog - tools_tokens, reduce_question, meta)
+                    plan = self._plan(c, n_ctx, self._prompt_tokens(msgs, tools_tokens))
+                    now = plan["usable"] - plan["free"]
+                if now > cog * 1.1:
+                    raise ModelError(
+                        "the prompt (~%d tokens) fits n_ctx=%d but exceeds the cognitive window "
+                        "(%d tokens): the answer would not be reliable. Pass auto_reduce=True or split "
+                        "the task." % (now, n_ctx, cog), kind="cognitive_overflow")
         if not plan["fits"]:
             raise ModelError("the prompt (~%d tokens) does not fit n_ctx=%d%s" % (
                 self._prompt_tokens(msgs, tools_tokens), n_ctx, "" if info.get("detected") else
@@ -2644,6 +2749,9 @@ class LlamaCppClient:
             reply.text = t[len(_ACTION_PREFIX):].strip()
         reply.ha_json_nel_testo, reply.json_nel_testo = _json_in_text(reply.text)
         reply.meta.update(meta)
+        if reply.finish_reason == "length":
+            reply.meta["truncated"] = True
+            log.warning("the answer is still cut by the token limit (%d tokens)", reply.tokens)
         if not reply.text and not reply.tool_calls:
             what = "only reasoning (finish_reason=%s)" % reply.finish_reason if reply.reasoning else "nothing"
             raise ModelError("the model returned %s; raw start: %r" % (what, reply.meta.get("raw_start", "")[:120]),
@@ -2719,27 +2827,59 @@ def invia_adattivo(testo_completo: str, prompt_base: str, base_url: str = DEFAUL
                    token_counter: Optional[Any] = None,
                    temperature_provider: Optional[Callable[[], float]] = None,
                    margine_sicurezza: float = 0.85, n_ctx: Optional[int] = None,
-                   verifica_esatta: bool = False) -> Tuple[List[Chunk], Dict[str, Any], List[Any]]:
+                   verifica_esatta: bool = False, verifica_tutti: bool = False
+                   ) -> Tuple[List[Chunk], Dict[str, Any], List[Any]]:
     """Split to fit the model and call ``on_chunk(chunk, meta, info)`` for each piece.
 
-    No piece limit. ``verifica_esatta=True`` asks the tokenizer for each chunk (one HTTP call per chunk).
+    No piece limit. ``verifica_esatta=True`` with a ``LlamaServerTokenizer``: the first chunk is
+    counted exactly (one HTTP call) and every other estimate is scaled by the ratio; if the server
+    counts MORE tokens than estimated the text is split again with a smaller limit.
+    ``verifica_tutti=True`` also counts every chunk exactly (one HTTP call each).
     """
     kind, info, eff = _adaptive_params(testo_completo, prompt_base, base_url, name, kind, max_chars,
                                        margine_sicurezza, token_counter, n_ctx)
     limit = info["spazio_per_pezzo"]
-    chunks = list(iter_chunks(testo_completo, name, kind=kind, max_chars=eff, max_tokens=limit,
-                              min_chars=min_chars, overlap=overlap, token_counter=token_counter,
-                              temperature_provider=temperature_provider))
+
+    def build(max_tokens: int) -> List[Chunk]:
+        return list(iter_chunks(testo_completo, name, kind=kind, max_chars=eff, max_tokens=max_tokens,
+                                min_chars=min_chars, overlap=overlap, token_counter=token_counter,
+                                temperature_provider=temperature_provider))
+
+    def exact_count(text: str) -> Optional[int]:
+        fn = getattr(token_counter, "try_count", None) or token_counter.count_exact  # type: ignore[union-attr]
+        try:
+            v = fn(text)
+            return None if v is None else int(v)
+        except Exception as exc:
+            log.debug("exact count failed: %s", exc)
+            return None
+
+    chunks = build(limit)
+    can_verify = bool(verifica_esatta or verifica_tutti) and hasattr(token_counter, "count_exact")
+    factor, first_exact = 1.0, None
+    if can_verify and chunks:
+        first_exact = exact_count(chunks[0].text)
+        first_est = estimate_tokens(chunks[0].text, chunks[0].kind)
+        if first_exact is not None and first_est > 0:
+            factor = first_exact / first_est
+            if factor > 1.0:
+                chunks = build(max(20, int(limit / factor * 0.95)))
+                first_exact = exact_count(chunks[0].text) if chunks else None
     results: List[Any] = []
     for i, ch in enumerate(chunks):
         estimated = _count(ch.text, ch.kind, token_counter)
         exact: Optional[int] = None
-        if verifica_esatta and hasattr(token_counter, "count_exact"):
-            try:
-                exact = int(token_counter.count_exact(ch.text))
-            except Exception as exc:
-                log.debug("count_exact failed for chunk %d: %s", i, exc)
-        tokens = exact if exact is not None else estimated
+        if can_verify:
+            if i == 0:
+                exact = first_exact
+            elif verifica_tutti:
+                exact = exact_count(ch.text)
+        if exact is not None:
+            tokens = exact
+        elif can_verify and first_exact is not None:
+            tokens = max(1, int(estimated * factor))
+        else:
+            tokens = estimated
         over = tokens > limit
         if over:
             log.warning("chunk %d has %d tokens > limit %d", i, tokens, limit)
@@ -2750,4 +2890,3 @@ def invia_adattivo(testo_completo: str, prompt_base: str, base_url: str = DEFAUL
         if on_chunk:
             results.append(on_chunk(ch, meta, info))
     return chunks, info, results
-
