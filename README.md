@@ -29,12 +29,43 @@ Italian edition: [README.it.md](README.it.md).
 Some public names are Italian (`trova_fatti`, `contesto`, `invia_adattivo`).
 They are kept as-is for compatibility.
 
-## Quickstart
+## Install
+
+Python 3.7+. **No runtime dependencies.** Not on PyPI yet.
+
+    pip install git+https://github.com/MalgTruevero/bocconcini_crunch.git
+
+Offline / Termux — no pip, no build, two files:
+
+    curl -O https://raw.githubusercontent.com/MalgTruevero/bocconcini_crunch/main/bocconcini.py
+    curl -O https://raw.githubusercontent.com/MalgTruevero/bocconcini_crunch/main/bocconcini_tree.py
+
+## First result — no model, no server
+
+    from bocconcini_tree import trova_fatti
+    doc = "filler " * 4000 + "The unlock code is ALFA-1." + "filler " * 4000
+    print(trova_fatti(doc))
+
+Python reads every character and returns the code with its sentence. This is the
+mechanism that found 4/4 hidden codes in 52 s where blind compression found 0/4
+in 42 min, on a Samsung S20 Ultra with a 4B model.
+
+Reproduce it:
+
+    python benchmark_tank.py --no-model   # scan only, no server, milliseconds
+    python benchmark_tank.py              # scan + one model call
+
+Exits 1 if a needle is missed.
+
+## With a local server
+
+Needs a running llama.cpp / KoboldCpp server. **Verified live: KoboldCpp only.**
 
     from bocconcini import LlamaCppClient
     cl = LlamaCppClient("http://127.0.0.1:5001")
     print(cl.chat("Answer with one word: ok"))
 
+Ollama and OpenAI-compatible cloud paths are implemented but **not verified live**.
 ## Finding facts without blind compression
 
     from bocconcini_tree import trova_fatti
