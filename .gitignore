@@ -3,3 +3,4 @@ __pycache__/
 *.bak*
 *.corrupt.json
 spill/
+bocconcini_docs.py
