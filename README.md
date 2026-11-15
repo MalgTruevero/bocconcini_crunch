@@ -36,3 +36,8 @@ Per cercare fatti usa trova_fatti o lo chunking esplicito.
 ## Licenza
 
 MIT.
+
+## Storia
+
+Il nome nasce da una torta troppo grande per una bocca piccola: [STORIA.md](STORIA.md).
+Se modifichi e ripubblichi, per cortesia porta con te quel file.
