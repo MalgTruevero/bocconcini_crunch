@@ -1,5 +1,10 @@
 # bocconcini
 
+[![tests](https://github.com/MalgTruevero/bocconcini_crunch/actions/workflows/tests.yml/badge.svg)](https://github.com/MalgTruevero/bocconcini_crunch/actions/workflows/tests.yml)
+
+**Use it for:** documents and prompts on local LLMs with a genuinely
+small context - Android/Termux, Raspberry Pi, old laptops, air-gapped machines.
+
 **Zero runtime dependencies.** A Python client for local LLMs whose *usable*
 window is smaller than the advertised one. Born on a Samsung S20 Ultra in
 Termux, built to never lie about what it did.
