@@ -57,6 +57,13 @@ Reproduce it:
 
 Exits 1 if a needle is missed.
 
+Reproduce it:
+
+    python benchmark_tank.py --no-model   # scan only, no server, milliseconds
+    python benchmark_tank.py              # scan + one model call
+
+Exits 1 if a needle is missed.
+
 ## With a local server
 
 Needs a running llama.cpp / KoboldCpp server. **Verified live: KoboldCpp only.**
