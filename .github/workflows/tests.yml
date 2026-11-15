@@ -1,0 +1,22 @@
+name: tests
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Regression suite (12 checks)
+        run: python test_regressioni.py
+      - name: Core suite (31 checks)
+        run: python test_bocconcini.py
+      - name: Headline claim, no model, no server
+        run: python benchmark_tank.py --no-model

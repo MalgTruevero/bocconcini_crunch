@@ -78,3 +78,4 @@ check("extract_local non vuoto", len(b.extract_local("x" * 500 + " temperatura",
 print("\n%d verifiche, %d fallite" % (n_check, len(fails)))
 if fails:
     print("Da guardare:", ", ".join(fails))
+    sys.exit(1)
