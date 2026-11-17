@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,9 +8,26 @@ version = "4.3.0"
 description = "Local LLM client for small usable windows. Zero runtime dependencies."
 readme = "README.md"
 requires-python = ">=3.7"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "Grasso Maurizio"}]
+keywords = ["llm", "local-llm", "context-window", "chunking", "rag", "koboldcpp", "llama-cpp", "termux", "android", "tokenizer"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Text Processing",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/MalgTruevero/bocconcini_crunch"
+Repository = "https://github.com/MalgTruevero/bocconcini_crunch"
+Issues = "https://github.com/MalgTruevero/bocconcini_crunch/issues"
+Benchmark = "https://github.com/MalgTruevero/bocconcini_crunch/blob/main/benchmark_tank.py"
 
 [tool.setuptools]
 py-modules = ["bocconcini", "bocconcini_tree"]
