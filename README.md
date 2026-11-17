@@ -9,6 +9,21 @@ small context - Android/Termux, Raspberry Pi, old laptops, air-gapped machines.
 window is smaller than the advertised one. Born on a Samsung S20 Ultra in
 Termux, built to never lie about what it did.
 
+## The problem
+
+A local model advertises 8k context but stops understanding around 2k. Long
+documents get silently truncated, compressed into summaries that delete the
+answer, or split in the middle of a string. You ask for a code buried in a log
+and the model invents one - because the pipeline removed it before the model
+ever saw it.
+
+bocconcini fixes the pipeline, not the model:
+
+- **Measures the real usable window** instead of trusting the advertised one.
+- **Refuses instead of silently degrading** - no quiet loss of the middle.
+- **Scans long documents deterministically**, then sends the model only the
+  sentences that matter.
+
 Why "bocconcini"? A child, a huge cake, a small mouth: [STORIA.md](STORIA.md).
 Italian edition: [README.it.md](README.it.md).
 
@@ -36,9 +51,9 @@ They are kept as-is for compatibility.
 
 ## Install
 
-Python 3.7+. **No runtime dependencies.** Not on PyPI yet.
+Python 3.7+. **No runtime dependencies.** On PyPI.
 
-    pip install git+https://github.com/MalgTruevero/bocconcini_crunch.git
+    pip install bocconcini
 
 Offline / Termux — no pip, no build, two files:
 

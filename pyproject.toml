@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bocconcini"
-version = "4.3.0"
+version = "4.3.1"
 description = "Local LLM client for small usable windows. Zero runtime dependencies."
 readme = "README.md"
 requires-python = ">=3.7"
