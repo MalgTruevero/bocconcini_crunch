@@ -18,5 +18,7 @@ jobs:
         run: python test_regressioni.py
       - name: Core suite (31 checks)
         run: python test_bocconcini.py
+      - name: Spill senza perdita
+        run: python test_spill.py
       - name: Headline claim, no model, no server
         run: python benchmark_tank.py --no-model

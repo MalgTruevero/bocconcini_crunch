@@ -1665,6 +1665,7 @@ class LlamaCppClient:
         self.model, self.timeout, self.api_key = model, timeout, api_key
         self.temperature_provider = temperature_provider
         self.n_ctx, self.auto_reduce, self.auto_max_tokens = n_ctx, auto_reduce, auto_max_tokens
+        self.spill, self.spill_dir, self._store = True, None, None
         self.persist_profile, self.target_seconds = persist_profile, target_seconds
         self.tokenizer, self.verify_tls, self.auto_reduce_mode = tokenizer, verify_tls, auto_reduce_mode
         self.cognitive_limit = int(cognitive_limit) if cognitive_limit else None
@@ -2583,8 +2584,23 @@ class LlamaCppClient:
             log.warning("dropped the %d oldest message(s) to fit the context", dropped)
         return out
 
+    def _spill_if_needed(self, msgs, budget, meta):
+        """Sposta su disco i contenuti oltre soglia. NON cancella messaggi."""
+        if not self.spill or self._prompt_tokens(msgs) <= budget:
+            return msgs
+        from bocconcini_spill import Spill, spill_messaggi
+        if self._store is None:
+            import tempfile
+            self._store = Spill(self.spill_dir or tempfile.mkdtemp(prefix="bocconcini_"))
+        out = spill_messaggi(msgs, self._store, soglia_caratteri=max(200, int(budget * 0.32)))
+        rami = [m["ramo"] for m in out if m.get("ramo")]
+        if rami:
+            meta["rami"] = rami
+        return out
+
     def _reduce_messages(self, msgs: List[Dict[str, Any]], budget: int, question: Optional[str],
                          meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+        msgs = self._spill_if_needed(msgs, budget, meta)
         msgs = self._drop_old_history(msgs, budget, meta)
         # The LAST message is the REQUEST, not data. Compressing it turns a
         # question into a mutilated fragment, and the model then answers about

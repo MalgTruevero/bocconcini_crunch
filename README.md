@@ -37,6 +37,10 @@ Italian edition: [README.it.md](README.it.md).
 
 - Chunks text / Python / JSON, never inside a string or an escape sequence.
 - Output budget from the context window, not from generation speed.
+- **Lossless spill:** in a loop, oversized content goes to disk and the prompt
+  keeps only a one-line index with its address. Nothing is deleted; the model
+  reopens a branch by id and gets byte-identical content. `pin: True` keeps a
+  message inline at any size.
 - **Cognitive window:** `client.calibra()` measures how much the model actually
   understands, not how much the server can hold. Only a passed probe is stored.
 - Detects silent prompt truncation, and only near the window: far from it a
