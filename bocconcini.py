@@ -2588,7 +2588,7 @@ class LlamaCppClient:
         """Sposta su disco i contenuti oltre soglia. NON cancella messaggi."""
         if not self.spill or self._prompt_tokens(msgs) <= budget:
             return msgs
-        from bocconcini_spill import Spill, spill_messaggi
+        from bocconcini_rami import Spill, spill_messaggi
         if self._store is None:
             import tempfile
             self._store = Spill(self.spill_dir or tempfile.mkdtemp(prefix="bocconcini_"))

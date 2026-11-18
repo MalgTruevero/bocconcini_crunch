@@ -1,5 +1,5 @@
 import tempfile
-import bocconcini_spill as sp
+import bocconcini_rami as sp
 
 n = fail = 0
 def ok(label, cond):
@@ -52,6 +52,19 @@ ok("loop: prompt sotto la finestra cognitiva", _cl._prompt_tokens(_out) <= 2048)
 ok("loop: nessuna cancellazione per anzianita", "history_dropped" not in _meta)
 ok("loop: byte identici dal percorso vero",
    _cl._store.get(_meta["rami"][0]) == _grande)
+
+# --- A/B: il dato letto PRESTO deve sopravvivere a un payload grosso dopo ---
+_ab = [{"role": "system", "content": "breve"},
+       {"role": "user", "content": "Dati batteria: " + _piccolo},
+       {"role": "assistant", "content": "Ricevuto."},
+       {"role": "user", "content": "File: " + _grande},
+       {"role": "assistant", "content": "Ricevuto."},
+       {"role": "user", "content": "Quanta batteria ho?"}]
+_c2 = _b.LlamaCppClient("http://127.0.0.1:1", n_ctx=4096, cognitive_limit=2048)
+_o2 = _c2._reduce_messages(_ab, 2048, None, {})
+ok("A/B: tutti i messaggi restano", len(_o2) == len(_ab))
+ok("A/B: il dato letto presto sopravvive",
+   any(_piccolo in str(m.get("content", "")) for m in _o2))
 
 print("\n%d verifiche, %d fallite" % (n, fail))
 raise SystemExit(1 if fail else 0)

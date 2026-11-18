@@ -30,4 +30,4 @@ Issues = "https://github.com/MalgTruevero/bocconcini_crunch/issues"
 Benchmark = "https://github.com/MalgTruevero/bocconcini_crunch/blob/main/benchmark_tank.py"
 
 [tool.setuptools]
-py-modules = ["bocconcini", "bocconcini_tree", "bocconcini_spill"]
+py-modules = ["bocconcini", "bocconcini_tree", "bocconcini_rami"]
