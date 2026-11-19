@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__all__ = ["DocNode", "DocTree", "TreeError", "etichetta", "naviga", "albero_codice", "trova_fatti"]
+__all__ = ["DocNode", "DocTree", "TreeError", "etichetta", "naviga", "albero_codice", "trova_fatti", "prepara_albero_ricco"]
 _MAX_BACKUPS = 50
 _DIARY_KEEP = 500
 _ZIP_ABOVE = 100
@@ -634,3 +634,73 @@ def trova_fatti(testo: str, max_per_tipo: int = 40, contesto: int = 90) -> List[
                 break
     out.sort(key=lambda d: d["pos"])
     return out
+
+
+def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"] = None, 
+                          max_chars: int = 1500, max_per_tipo: int = 100) -> Tuple["DocTree", str]:
+    """Costruisce un albero con summary arricchiti dai fatti deterministici.
+    
+    Chunka il documento, estrae tutti i fatti con trova_fatti(), e per ogni chunk
+    inserisce nel summary i fatti che cadono in quel range. Questo rende i fatti
+    visibili nell'indice senza dover aprire i rami.
+    
+    Args:
+        documento: testo completo da indicizzare
+        sessione: nome della sessione per DocTree
+        tree: DocTree esistente (se None, usa ~/.cache/bocconcini/workspace)
+        max_chars: dimensione massima dei chunk
+        max_per_tipo: quanti fatti estrarre per tipo (default 100 invece di 40)
+    
+    Returns:
+        (tree, sessione) - il tree con l'albero salvato
+    
+    Example:
+        >>> import bocconcini as b
+        >>> import bocconcini_tree as t
+        >>> tree, session = t.prepara_albero_ricco(documento_enorme, "test")
+        >>> risultato = t.naviga(client, tree, session, domanda, budget_tokens=1500)
+    """
+    from bocconcini import split_text
+    
+    if tree is None:
+        tree = DocTree()
+    
+    # 1. Chunking del documento
+    chunks = split_text(documento, name="documento.txt", kind="text", 
+                       max_chars=max_chars, max_tokens=10000, min_chars=300, overlap=0)
+    
+    # 2. Estrazione deterministica di tutti i fatti
+    tutti_i_fatti = trova_fatti(documento, max_per_tipo=max_per_tipo)
+    
+    # 3. Costruzione dei nodi con summary arricchiti
+    roots = []
+    for i, ch in enumerate(chunks):
+        node_id = f"sec_{i:03d}"
+        
+        # Etichetta standard
+        meta_etichetta = etichetta(ch.text, name="documento.txt")
+        
+        # Trova i fatti che cadono in questo chunk
+        fatti_nel_chunk = [
+            f"{f['tipo']}:{f['valore']}" 
+            for f in tutti_i_fatti 
+            if ch.start <= f['pos'] < ch.end
+        ]
+        
+        # Arricchisci il summary
+        summary_base = meta_etichetta["summary"]
+        if fatti_nel_chunk:
+            summary_base = f"CHIAVE -> {', '.join(fatti_nel_chunk)} | {summary_base}"
+        
+        roots.append(DocNode(
+            id=node_id,
+            label=f"Sezione {i} (pos {ch.start}-{ch.end})",
+            summary=summary_base,
+            text=ch.text,
+            tokens=ch.token_count_estimate()
+        ))
+    
+    # 4. Salvataggio dell'albero
+    tree.save(sessione, roots)
+    
+    return tree, sessione
