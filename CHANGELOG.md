@@ -1,5 +1,20 @@
 # Changelog
 
+## 5.0.0
+
+### Changed (breaking)
+- `bocconcini` is now a package (`bocconcini/`) with submodules `client`, `memory`, `docs`, `rami`.
+- One public entry point: `from bocconcini import ...`. The facade exports 20 names in `__all__`; private helpers are no longer reachable from the package root.
+- The local `libreria_bocconcini` import path is retired.
+
+### Added
+- `prepara_albero_ricco`: summaries enriched with deterministic facts.
+- Tree/facts API exposed: `DocTree`, `DocNode`, `TreeError`, `ask_stepwise`, `trova_fatti`, `calibra_navigazione`.
+
+### Fixed
+- Tool results survive budget reduction intact, verified end to end through `chat_full(auto_reduce=True)`: a 10,361-token history against a 2,048-token cognitive window still delivers the tool datum to the answer.
+- Early-read data survives a later large payload (permanent A/B, 59 checks).
+
 ## 4.4.0
 
 ### Added

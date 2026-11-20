@@ -8,7 +8,7 @@ Esce con 1 se la scansione perde un ago o se il modello risponde sbagliato.
 import sys, time, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bocconcini as b
-from bocconcini_tree import trova_fatti
+from bocconcini import trova_fatti
 
 NEEDLES = ("ALFA-1", "OMEGA-9", "TITANO-3", "BETA-7")
 FILLER = ("Il sistema ha registrato un picco di utilizzo della CPU. I thread di "

@@ -1,6 +1,5 @@
 """Verifica le garanzie di bocconcini. Nessun server, gira in un secondo."""
 import sys, pathlib, json
-sys.path.insert(0, str(pathlib.Path.home() / "malg" / "libreria_bocconcini"))
 import bocconcini as b
 
 fails = []
@@ -64,9 +63,6 @@ ch = b.split_text(prosa, "p", kind="text", max_chars=1000, max_tokens=100000,
 check("scala termica a 48C", all(len(c) <= 400 for c in ch),
       "max %d" % max(len(c) for c in ch))
 
-check("stitch toglie il duplicato", b._stitch("Il valore di temperatura supera i 45 gradi",
-      "supera i 45 gradi e continua a salire") == " e continua a salire")
-check("stitch ignora sovrapposizioni corte", b._stitch("abc def ghi", "ghi jkl") == "ghi jkl")
 check("thinking chiuso", b.split_thinking("<think>x</think>risposta")[0] == "risposta")
 check("thinking aperto = troncato", b.split_thinking("<think>sto pensando") == ("", "sto pensando", True))
 check("tool call nel testo", b.parse_tool_calls_from_text(

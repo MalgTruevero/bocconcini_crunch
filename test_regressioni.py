@@ -2,7 +2,7 @@ import sys, pathlib, tempfile, json
 from collections import Counter
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bocconcini as b
-import bocconcini_tree as t
+import bocconcini as t
 
 n = fail = 0
 def ok(name, cond):
@@ -63,7 +63,12 @@ with tempfile.TemporaryDirectory() as td:
     p = pathlib.Path(td) / "m.py"
     src = "# commento\nimport os\n\nCONST = 1\n\ndef f(x):\n    return x\n\nclass C:\n    def m(self):\n        return 2\n"
     p.write_text(src, encoding="utf-8")
-    tutti = list(t._walk(t.albero_codice(p)))
+    tutti = []
+    pila = list(t.albero_codice(p))
+    while pila:
+        nd = pila.pop()
+        tutti.append(nd)
+        pila.extend(nd.children)
     orig = Counter(src.splitlines())
     rico = Counter(l for nd in tutti if nd.text for l in nd.text.split("\n"))
     ok("albero_codice: lossless", sum((orig - rico).values()) == 0 and sum((rico - orig).values()) == 0)

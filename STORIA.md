@@ -35,3 +35,15 @@ Il nome mi piacerebbe che restasse. Non è un'imposizione: è una cortesia che
 chiedo a chi adatta la libreria alle proprie esigenze e la ripubblica.
 
 La mia versione si chiama **Bocconcini_crunch**.
+
+## It was not born as a library
+
+It began as one private agent, written in Italian, because that was the language
+I could think in while fixing it. Nothing was meant to be published.
+
+But the problems were not my agent's problems. They were the problems of a small
+model on a small device, and anyone doing that work would meet them. So the parts
+that got past the phone's limits were pulled out, translated, and given away.
+
+A few Italian words survive in the code. They are not stains to hide. They are
+where it came from.

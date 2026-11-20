@@ -1,5 +1,5 @@
 import tempfile
-import bocconcini_rami as sp
+import bocconcini as sp
 
 n = fail = 0
 def ok(label, cond):

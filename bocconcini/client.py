@@ -1783,7 +1783,10 @@ class LlamaCppClient:
         content = self._exact_content(text)
         if content is None:                     # never learn the template from an estimate
             return
-        tt = estimate_tokens(json.dumps(tools, ensure_ascii=False), "json") if tools else 0
+        if tools:
+            return          # schema cost is an ESTIMATE: learning it as per-message
+                            # overhead would count the same error twice
+        tt = 0
         per_msg = (real - content - tt) / max(1, len(msgs))
         if 1.0 <= per_msg <= 64.0:
             profile_update(self._hw_key(), overhead=per_msg, persist=self.persist_profile)
@@ -2568,7 +2571,7 @@ class LlamaCppClient:
     def _drop_old_history(self, msgs: List[Dict[str, Any]], budget: int, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Drop the OLDEST non-system messages until the conversation fits ``budget`` tokens.
 
-        The last message is never dropped. Cheaper and safer than summarising: nothing is invented.
+        The last message and all tool results are never dropped. Cheaper than summarising (nothing is invented), and safe for agentic loops (prevents tool data amnesia).
         """
         cost = self._prompt_tokens
         out = list(msgs)
@@ -2588,7 +2591,7 @@ class LlamaCppClient:
         """Sposta su disco i contenuti oltre soglia. NON cancella messaggi."""
         if not self.spill or self._prompt_tokens(msgs) <= budget:
             return msgs
-        from bocconcini_rami import Spill, spill_messaggi
+        from .rami import Spill, spill_messaggi
         if self._store is None:
             import tempfile
             self._store = Spill(self.spill_dir or tempfile.mkdtemp(prefix="bocconcini_"))
@@ -2608,7 +2611,7 @@ class LlamaCppClient:
         # (which passes reduce_question) may reduce it.
         last = len(msgs) - 1
         idxs = [i for i, m in enumerate(msgs)
-                if m.get("role") != "system" and (question or i != last)]
+                if m.get("role") not in ("system", "tool") and (question or i != last)]
         if not idxs:
             meta["reduce_skipped"] = "only the request would be reducible"
             log.warning("nothing to reduce except the request: refusing to mangle it")
@@ -2906,3 +2909,9 @@ def invia_adattivo(testo_completo: str, prompt_base: str, base_url: str = DEFAUL
         if on_chunk:
             results.append(on_chunk(ch, meta, info))
     return chunks, info, results
+
+# -- Public API bridge for document memory management --
+from .memory import (
+    ask_stepwise, DocTree, DocNode, TreeError,
+    trova_fatti, prepara_albero_ricco, calibra_navigazione
+)

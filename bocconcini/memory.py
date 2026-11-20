@@ -1,4 +1,4 @@
-"""bocconcini_tree - verbatim chunks on disk, only the index in RAM.
+"""bocconcini_memory - verbatim chunks on disk, only the index in RAM.
 
 Standard library only. Python informs (structure, labels), the model decides
 (which branch to read). Nothing here calls a model or a server.
@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__all__ = ["DocNode", "DocTree", "TreeError", "etichetta", "naviga", "albero_codice", "trova_fatti", "prepara_albero_ricco"]
+from .client import split_text
+__all__ = ["DocNode", "DocTree", "TreeError", "etichetta", "naviga", "albero_codice", "trova_fatti", "prepara_albero_ricco", "calibra_navigazione"]
 _MAX_BACKUPS = 50
 _DIARY_KEEP = 500
 _ZIP_ABOVE = 100
@@ -220,15 +221,24 @@ class DocTree:
         head = "Percorso: " + (" > ".join(path) if path else "(radice)")
         used = len(head) + 1
         rows: List[str] = []
-        i = max(0, int(offset))
+        i = min(max(0, int(offset)), len(level))
+        first = i
+        ridotto = False
         while i < len(level):
             n = level[i]
             row = "- id=%s | %s" % (n["id"], n.get("label") or "")
             if n.get("summary"):
                 row += " | " + n["summary"]
             row += " | %d token%s" % (int(n.get("tokens") or 0), ", ha figli" if n.get("children") else "")
-            if used + len(row) + 1 > cap:
-                break
+            if ridotto:
+                row = _riga_min(n, cap - used - 1)
+                if used + len(row) + 1 > cap:
+                    break
+            elif used + len(row) + 1 > cap:
+                if i > first:
+                    break
+                row = _riga_min(n, cap - used - 1)
+                ridotto = True
             rows.append(row)
             used += len(row) + 1
             i += 1
@@ -244,6 +254,16 @@ _STOP = frozenset("""anche allora altro alcuni alcune ancora appena avere circa 
 della delle dello degli dopo dove essere fatto hanno molto nulla ogni para pelo pela perche quando
 quale quali quello questo questa queste questi quelli sono stato sulla sulle sullo suoi their there
 these those things through thus were what when where which while will with would""".split())
+
+
+def _riga_min(n, spazio):
+    base = "- id=%s" % n["id"]
+    tail = " | %d token%s" % (int(n.get("tokens") or 0), ", ha figli" if n.get("children") else "")
+    lab = str(n.get("label") or "")[:80]
+    room = spazio - len(base) - len(tail) - 20
+    if room < 8 or not lab:
+        return base + tail + " [indice ridotto]"
+    return base + " | " + lab[:room] + tail + " [indice ridotto]"
 
 
 def etichetta(text: str, name: str = "", max_len: int = 160) -> Dict[str, str]:
@@ -306,27 +326,35 @@ _REGOLE = (
     "L'indice mostra solo una pagina: se un nome non appare, usa cerca_nodo(query) per trovarlo.")
 
 
-def _msg_tokens(msgs: List[Dict[str, Any]], cpt: float) -> int:
-    return int(sum(len(str(m.get("content") or "")) for m in msgs) / cpt) + 8 * len(msgs)
+def _msg_tokens(msgs: List[Dict[str, Any]], cpt: float, per_msg: float = 8.0) -> int:
+    return int(sum(len(str(m.get("content") or "")) for m in msgs) / cpt + per_msg * len(msgs))
 
 
-def _evict(msgs: List[Dict[str, Any]], budget: int, cpt: float) -> int:
+def _evict(msgs: List[Dict[str, Any]], budget: int, cpt: float, per_msg: float = 8.0, question: str = "") -> int:
     """Replace OLDER branch contents with a declared stub. Reversible: the text is
     on disk. The NEWEST branch is never removed -- the model just asked for it."""
-    newest = max((i for i, m in enumerate(msgs) if m.get("role") == "tool"), default=-1)
+    last_ai = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=-1)
+    fresh = {i for i, m in enumerate(msgs) if m.get("role") == "tool" and i > last_ai}
     removed = 0
-    while _msg_tokens(msgs, cpt) > budget:
+    while _msg_tokens(msgs, cpt, per_msg) > budget:
         target = None
         for i, m in enumerate(msgs):
-            if i != newest and m.get("role") == "tool" and not m.get("_stub"):
+            if i not in fresh and m.get("role") == "tool" and not m.get("_stub"):
                 target = i
                 break
         if target is None:
             break
         nid = msgs[target].get("_node") or ""
         if nid:
-            msgs[target]["content"] = ("[ramo %s rimosso dal contesto per fare spazio: e' ancora su "
-                                       "disco, chiama leggi_nodo('%s') per rileggerlo]" % (nid, nid))
+            kept = str(msgs[target].get("_facts") or "")
+            if not kept and question:
+                old = str(msgs[target].get("content") or "")
+                words = {w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9_]{3,}", question)}
+                parts = re.split(r"(?<=[.!?])\s+", old)
+                kept = " ".join(seg.strip() for seg in parts if any(w in seg.lower() for w in words))[:180]
+            keep = (" facts found -> " + kept + ".") if kept else ""
+            msgs[target]["content"] = ("[branch %s evicted from context.%s Text stays on disk; "
+                                       "ask leggi_nodo for %s again]" % (nid, keep, nid))
         else:
             msgs[target]["content"] = "[esito precedente rimosso per fare spazio; usa cerca_nodo o leggi_nodo se ti serve]"
         msgs[target]["_stub"] = True
@@ -342,25 +370,46 @@ def _level_ids(tree: "DocTree", session: str, node_id: Optional[str] = None) -> 
 
 _CERCA = {"type": "function", "function": {
     "name": "cerca_nodo",
-    "description": "Cerca un nome o parola negli id/etichette dell'albero. Restituisce id completi. Usalo se il ramo non e' nella pagina visibile.",
+    "description": "Search ids, labels, summaries AND the verbatim text of every branch. Returns full ids. Use it when what you need is not on the visible page.",
     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
 
 
 def _cerca(tree: "DocTree", session: str, query: str, limit: int = 8) -> Tuple[str, List[str]]:
+    """Search ids, labels, summaries AND the verbatim text of every branch.
+    Ids/labels alone made the tool useless: a word present in the document was
+    reported as absent. Python reads the disk, the model only receives ids."""
     q = (query or "").strip().lower()
     if not q:
-        return "[query vuota]", []
-    hits = [k for k, v in tree.keys(session).items()
-            if q in k.lower() or q in str(v.get("label", "")).lower()][:limit]
+        return "[empty query]", []
+    keys = tree.keys(session)
+    order = sorted(keys)
+    hits = [k for k in order if q in k.lower()
+            or q in str(keys[k].get("label", "")).lower()
+            or q in str(keys[k].get("summary", "")).lower()][:limit]
+    for k in order:
+        if len(hits) >= limit:
+            break
+        if k in hits:
+            continue
+        try:
+            if q in tree.load(session, k).lower():
+                hits.append(k)
+        except TreeError:
+            continue
     if not hits:
-        return "[nessun ramo corrisponde a %r. Prova un altro nome.]" % query, []
-    return "Rami trovati (chiama leggi_nodo con l'id completo):\n" + "\n".join("- " + k for k in hits), hits
+        alt = re.sub(r"^[a-z]+\s*[:\s]\s*", "", q).strip()
+        if alt and alt != q:
+            return _cerca(tree, session, alt, limit)
+    if not hits:
+        return "[no branch matches %r. Try another word.]" % query, []
+    return ("Matching branches (call leggi_nodo with the full id):\n"
+            + "\n".join("- " + k for k in hits)), hits
 
 
 def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
            budget_tokens: Optional[int] = None, chars_per_token: float = 3.2,
            max_hops: int = 3, max_repeats: int = 2, max_tokens: int = 400,
-           temperature: float = 0.2, require_read: bool = True) -> Dict[str, Any]:
+           temperature: float = 0.2, require_read: bool = True, max_calls: int = 1) -> Dict[str, Any]:
     """The model navigates, Python informs and enforces the budget.
 
     ``max_hops`` reads, then ONE final turn with no tools: the model answers with
@@ -370,6 +419,10 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
     """
     budget = int(budget_tokens or 1200)
     cpt = max(1.0, float(chars_per_token))
+    try:
+        ovh = float(client._hw().get("msg_overhead") or 8.0)
+    except Exception:
+        ovh = 8.0
     cap = max(300, int(budget * cpt * 0.5))
     meta: Dict[str, Any] = {"hops": 0, "nodes_read": [], "evicted": 0, "repeats": 0,
                             "branches_cut": [], "unknown_ids": [], "forced_answer": False,
@@ -390,14 +443,16 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
     answer = ""
     hops = max(0, int(max_hops))
     for turn in range(hops + 1):
+        if meta.get("_notice"):
+            msgs.append({"role": "user", "content": meta.pop("_notice")})
         final = turn >= hops
-        tools_now = None if final else ([_LEGGI] if (require_read and not meta["nodes_read"]) else [_LEGGI, _CERCA])
-        meta["evicted"] += _evict(msgs, max(200, budget - 256), cpt)
+        tools_now = None if final else [_LEGGI, _CERCA]
+        meta["evicted"] += _evict(msgs, max(200, budget - 256), cpt, ovh, question)
         try:
             tt = int(len(json.dumps(tools_now, ensure_ascii=False)) / 2.5) + 1 if tools_now else 0
             pt = client._prompt_tokens(msgs, tt)
         except Exception:
-            pt = _msg_tokens(msgs, cpt) + (256 if tools_now else 0)
+            pt = _msg_tokens(msgs, cpt, ovh) + (256 if tools_now else 0)
         if pt > budget:
             meta["stopped"] = "budget: prompt ~%d > %d" % (pt, budget)
             break
@@ -418,9 +473,15 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
             answer = r.text
             break
         meta["hops"] += 1
-        msgs.append({"role": "assistant", "content": r.text or "", "tool_calls": r.tool_calls})
+        calls = [c for c in r.tool_calls if str(c.get("function", {}).get("name")) == "cerca_nodo"][:4] + [c for c in r.tool_calls if str(c.get("function", {}).get("name")) != "cerca_nodo"][:max(1, int(max_calls))]
+        if len(r.tool_calls) > len(calls):
+            meta["deferred"] = meta.get("deferred", 0) + len(r.tool_calls) - len(calls)
+            meta["_notice"] = ("[%d calls asked, %d honoured; "
+                               "ask the rest one per turn.]" % (len(r.tool_calls), len(calls)))
+        msgs.append({"role": "assistant", "content": r.text or "", "tool_calls": calls})
         valid = tree.keys(session)
-        for call in r.tool_calls:
+        reads_turn = 0
+        for call in calls:
             try:
                 args = json.loads(call.get("function", {}).get("arguments") or "{}")
             except ValueError:
@@ -436,6 +497,7 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                 msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": "[strumento sconosciuto: usa leggi_nodo o cerca_nodo]", "_node": ""})
                 continue
             nid = str(args.get("id") or "")
+            nf = ""
             if not nid:
                 meta["empty_ids"] = meta.get("empty_ids", 0) + 1
                 sug = ", ".join(named or shown) or "(nessuno)"
@@ -455,20 +517,26 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                                  "content": "[nome ambiguo: usa l'id completo, uno di questi: %s]"
                                             % ", ".join(cand[:6]), "_node": nid})
                     continue
-            seen[nid] = seen.get(nid, 0) + 1
             if nid not in valid:
                 meta["unknown_ids"].append(nid)
                 body = ("[il ramo %r NON ESISTE. Non inventare id: copia uno di questi, che sono "
                         "quelli elencati: %s]" % (nid, ", ".join(shown) or "(nessuno)"))
-            elif seen[nid] > max_repeats:
+            elif seen.get(nid, 0) >= max_repeats:
                 meta["repeats"] += 1
                 body = ("[hai gia' letto il ramo %s %d volte: non te lo rimando. Usa quello che "
-                        "hai, o chiedi un altro ramo.]" % (nid, seen[nid]))
+                        "hai, o chiedi un altro ramo.]" % (nid, seen.get(nid, 0)))
+            elif reads_turn and _msg_tokens(msgs, cpt, ovh) + int(min(cap, int(valid.get(nid, {}).get("chars") or cap)) / cpt) + 8 > max(200, budget - 256):
+                meta["deferred"] = meta.get("deferred", 0) + 1
+                body = ("[branch %s NOT read: this turn already carries %d branch(es). "
+                        "Ask for it again on the next turn.]" % (nid, reads_turn))
             else:
+                reads_turn += 1
                 try:
                     full = tree.load(session, nid)
                     meta["nodes_read"].append(nid)
+                    seen[nid] = seen.get(nid, 0) + 1
                     body = full
+                    nf = ", ".join("%s:%s" % (f["tipo"], f["valore"]) for f in trova_fatti(full, max_per_tipo=6))[:180]
                     if len(body) > cap:
                         body = full[:cap] + ("\n[ramo tagliato: %d caratteri su %d. Per il resto "
                                              "chiedi un ramo piu' specifico.]" % (cap, len(full)))
@@ -486,12 +554,12 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                     body = "[ramo non leggibile: %s]" % exc
                     meta.setdefault("unreadable", []).append(nid)
             msgs.append({"role": "tool", "tool_call_id": call.get("id") or "",
-                         "content": body, "_node": nid})
+                         "content": body, "_node": nid, "_facts": nf})
     if answer and not meta["nodes_read"]:
         meta["answered_from_index"] = True
     if not answer and not meta["stopped"]:
         meta["stopped"] = "no_answer"
-    meta["evicted"] += _evict(msgs, budget, cpt)
+    meta["evicted"] += _evict(msgs, budget, cpt, ovh, question)
     return {"text": answer, "meta": meta, "messages": msgs}
 
 _DEFNODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -637,7 +705,7 @@ def trova_fatti(testo: str, max_per_tipo: int = 40, contesto: int = 90) -> List[
 
 
 def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"] = None, 
-                          max_chars: int = 1500, max_per_tipo: int = 100) -> Tuple["DocTree", str]:
+                          max_chars: int = 1500, max_per_tipo: int = 100, tetto_fatti: int = 180) -> Tuple["DocTree", str]:
     """Costruisce un albero con summary arricchiti dai fatti deterministici.
     
     Chunka il documento, estrae tutti i fatti con trova_fatti(), e per ogni chunk
@@ -650,18 +718,21 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
         tree: DocTree esistente (se None, usa ~/.cache/bocconcini/workspace)
         max_chars: dimensione massima dei chunk
         max_per_tipo: quanti fatti estrarre per tipo (default 100 invece di 40)
+        tetto_fatti: max characters of the fact block in each summary (default 180).
+            Facts are ordered by GLOBAL RARITY of their type: a type with 4 hits in
+            the document is signal, one with 100 hits is noise, so rare types are
+            rendered first. What does not fit is counted and declared, never dropped
+            in silence; the verbatim text of every branch stays on disk.
     
     Returns:
         (tree, sessione) - il tree con l'albero salvato
     
     Example:
         >>> import bocconcini as b
-        >>> import bocconcini_tree as t
+        >>> import bocconcini_memory as t
         >>> tree, session = t.prepara_albero_ricco(documento_enorme, "test")
         >>> risultato = t.naviga(client, tree, session, domanda, budget_tokens=1500)
     """
-    from bocconcini import split_text
-    
     if tree is None:
         tree = DocTree()
     
@@ -671,6 +742,10 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
     
     # 2. Estrazione deterministica di tutti i fatti
     tutti_i_fatti = trova_fatti(documento, max_per_tipo=max_per_tipo)
+    fact_counts = {}
+    for f in tutti_i_fatti:
+        fact_counts[f["tipo"]] = fact_counts.get(f["tipo"], 0) + 1
+    signal_rank = {t: i for i, t in enumerate(sorted(fact_counts, key=lambda t: (fact_counts[t], t)))}
     
     # 3. Costruzione dei nodi con summary arricchiti
     roots = []
@@ -688,9 +763,22 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
         ]
         
         # Arricchisci il summary
+        # Rarest fact types first: 100 hits of a type is noise, 4 hits is signal.
+        fatti_nel_chunk.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
         summary_base = meta_etichetta["summary"]
         if fatti_nel_chunk:
-            summary_base = f"CHIAVE -> {', '.join(fatti_nel_chunk)} | {summary_base}"
+            visibili, usati = [], 0
+            for f in fatti_nel_chunk:
+                f = f if len(f) <= 80 else f[:77] + "..."
+                if visibili and usati + len(f) + 2 > tetto_fatti:
+                    break
+                visibili.append(f)
+                usati += len(f) + 2
+            blocco = "CHIAVE -> " + ", ".join(visibili)
+            resto = len(fatti_nel_chunk) - len(visibili)
+            if resto:
+                blocco += " (+%d altri nel ramo)" % resto
+            summary_base = blocco + (" | " + summary_base if summary_base else "")
         
         roots.append(DocNode(
             id=node_id,
@@ -704,3 +792,89 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
     tree.save(sessione, roots)
     
     return tree, sessione
+
+
+def calibra_navigazione(client, max_profondita=10, budget_tokens=1500,
+                         session_prefix="calib_naviga") -> int:
+    """Misura quanti livelli di profondita' il modello riesce a navigare prima di perdere il filo.
+
+    Costruisce alberi lineari di profondita' crescente. L'ago (un codice) e' sempre
+    nell'ultimo nodo. Per ogni profondita', naviga() deve trovarlo. Quando smette di
+    trovarlo, quella e' la profondita' limite.
+
+    Returns: la profondita' massima navigata con successo (0 = nessuna).
+    """
+    limite = 0
+    for prof in range(1, max_profondita + 1):
+        ago = "%04d" % (int.from_bytes(os.urandom(2), "big") % 9000 + 1000)
+        nodo = None
+        for i in range(prof - 1, -1, -1):
+            if i == prof - 1:
+                nodo = DocNode(id="sec_%03d" % i, label="Sezione %d" % i,
+                              summary="Contiene un codice di verifica",
+                              text="Il codice di verifica e' %s." % ago)
+            else:
+                nodo = DocNode(id="sec_%03d" % i, label="Sezione %d" % i,
+                              summary="Contenitore, ha un sotto-ramo",
+                              text="Questa sezione rimanda al suo sotto-ramo.",
+                              children=[nodo])
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tree = DocTree(Path(td))
+            session = "%s_%d" % (session_prefix, prof)
+            tree.save(session, [nodo])
+            out = naviga(client, tree, session,
+                        "Qual e' il codice di verifica?",
+                        budget_tokens=budget_tokens, max_hops=prof + 2)
+            if ago in out.get("text", ""):
+                limite = prof
+            else:
+                break
+    return limite
+
+
+def ask_stepwise(client, documento: str, question: str, *, targets=None,
+                 max_tokens: int = 120, window: int = 200, per_target: int = 2,
+                 temperature: float = 0.0) -> Dict[str, Any]:
+    """One target at a time, each in a FRESH context. Python keeps the findings.
+
+    The model never has to remember what it already did: every sub-task starts
+    with an empty history and sees only the verbatim windows for ITS target.
+    The answers accumulate outside the model, so nothing is ever evicted.
+    """
+    low = documento.lower()
+    if not targets:
+        r = client.chat_full(prompt=("List the distinct items to find in this request, "
+                                     "one per line, no numbering, no explanation.\nRequest: "
+                                     + question), max_tokens=60, temperature=0.0, continua=False)
+        targets = [ln.strip(" -\t0123456789.") for ln in (r.text or "").splitlines()]
+        targets = [x for x in targets if 2 < len(x) <= 40][:8]
+    findings, calls, biggest = [], 0, 0
+    for tg in targets:
+        q = str(tg).lower().strip()
+        wins, start = [], 0
+        while len(wins) < per_target:
+            k = low.find(q, start)
+            if k < 0:
+                break
+            a, b = max(0, k - window // 2), min(len(documento), k + len(q) + window // 2)
+            wins.append(documento[a:b].replace("\n", " "))
+            start = k + len(q)
+        if not wins:
+            findings.append((tg, "NOT FOUND"))
+            continue
+        p = ("VERBATIM EXCERPTS:\n" + "\n".join("- " + w for w in wins)
+             + "\n\nWhat is the value for '" + str(tg) + "'? Answer with the value only, "
+             + "or NOT FOUND if it is not in the excerpts.")
+        biggest = max(biggest, len(p))
+        r = client.chat_full(prompt=p, max_tokens=max_tokens,
+                             temperature=temperature, continua=False)
+        calls += 1
+        findings.append((tg, (r.text or "").strip()))
+    righe = "\n".join("%s: %s" % (k, v) for k, v in findings)
+    p = ("FINDINGS already extracted:\n" + righe + "\n\nAnswer this request using only "
+         + "the findings above.\nRequest: " + question)
+    biggest = max(biggest, len(p))
+    r = client.chat_full(prompt=p, max_tokens=300, temperature=temperature, continua=False)
+    return {"text": r.text or "", "meta": {"targets": list(targets), "findings": findings,
+                                          "sub_calls": calls, "biggest_prompt_chars": biggest}}
