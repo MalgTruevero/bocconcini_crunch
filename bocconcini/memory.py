@@ -578,7 +578,19 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
         except Exception:
             pt = _msg_tokens(msgs, cpt, ovh) + (256 if tools_now else 0)
         if pt > budget:
-            meta["stopped"] = "budget: prompt ~%d > %d" % (pt, budget)
+            if meta["hops"] > 0 or meta["nodes_read"]:
+                meta["stopped"] = "budget: prompt ~%d > %d (forced answer)" % (pt, budget)
+                meta["forced_answer"] = True
+                try:
+                    meta["evicted"] += _evict(msgs, budget, cpt, ovh, question,
+                                             cost=lambda ms: client._prompt_tokens(ms, None))
+                    r = client.chat_full(messages=msgs, tools=None, temperature=temperature,
+                                        max_tokens=max_tokens, continua=False)
+                    answer = r.text
+                except Exception as exc:
+                    meta["stopped"] += "; error: %s" % exc
+            else:
+                meta["stopped"] = "budget: prompt ~%d > %d" % (pt, budget)
             break
         cap = _read_cap(client, msgs, tt, budget, max_tokens if final else 0, max_calls, cpt); meta.setdefault("caps",[]).append(cap)
         if final:
