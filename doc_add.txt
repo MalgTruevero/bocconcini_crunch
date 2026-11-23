@@ -1,0 +1,5 @@
+        tetto_fatti: max characters of the fact block in each summary (default 180).
+            Facts are ordered by GLOBAL RARITY of their type: a type with 4 hits in
+            the document is signal, one with 100 hits is noise, so rare types are
+            rendered first. What does not fit is counted and declared, never dropped
+            in silence; the verbatim text of every branch stays on disk.

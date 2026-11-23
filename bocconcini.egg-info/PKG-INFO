@@ -1,0 +1,144 @@
+Metadata-Version: 2.4
+Name: bocconcini
+Version: 5.0.0
+Summary: Local LLM client for small usable windows. Zero runtime dependencies.
+Author: Grasso Maurizio
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/MalgTruevero/bocconcini_crunch
+Project-URL: Repository, https://github.com/MalgTruevero/bocconcini_crunch
+Project-URL: Issues, https://github.com/MalgTruevero/bocconcini_crunch/issues
+Project-URL: Benchmark, https://github.com/MalgTruevero/bocconcini_crunch/blob/main/benchmark_tank.py
+Keywords: llm,local-llm,context-window,chunking,rag,koboldcpp,llama-cpp,termux,android,tokenizer
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Text Processing
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
+# bocconcini
+
+[![tests](https://github.com/MalgTruevero/bocconcini_crunch/actions/workflows/tests.yml/badge.svg)](https://github.com/MalgTruevero/bocconcini_crunch/actions/workflows/tests.yml)
+
+**Use it for:** documents and prompts on local LLMs with a genuinely
+small context - Android/Termux, Raspberry Pi, old laptops, air-gapped machines.
+
+**Zero runtime dependencies.** A Python client for local LLMs whose *usable*
+window is smaller than the advertised one. Born on a Samsung S20 Ultra in
+Termux, built to never lie about what it did.
+
+## The problem
+
+A local model advertises 8k context but stops understanding around 2k. Long
+documents get silently truncated, compressed into summaries that delete the
+answer, or split in the middle of a string. You ask for a code buried in a log
+and the model invents one - because the pipeline removed it before the model
+ever saw it.
+
+bocconcini fixes the pipeline, not the model:
+
+- **Measures the real usable window** instead of trusting the advertised one.
+- **Refuses instead of silently degrading** - no quiet loss of the middle.
+- **Scans long documents deterministically**, then sends the model only the
+  sentences that matter.
+
+Why "bocconcini"? A child, a huge cake, a small mouth: [STORIA.md](STORIA.md).
+Italian edition: [README.it.md](README.it.md).
+
+## Verification status
+
+- **Verified live:** KoboldCpp, Samsung S20 Ultra, smol-tools-4b.
+- **Implemented but NOT verified live:** llama.cpp native, Ollama, cloud.
+- 43 checks: `python test_bocconcini.py` and `python test_regressioni.py`.
+
+## What it does
+
+- Chunks text / Python / JSON, never inside a string or an escape sequence.
+- Output budget from the context window, not from generation speed.
+- **Lossless spill:** in a loop, oversized content goes to disk and the prompt
+  keeps only a one-line index with its address. Nothing is deleted; the model
+  reopens a branch by id and gets byte-identical content. `pin: True` keeps a
+  message inline at any size.
+- **Cognitive window:** `client.calibra()` measures how much the model actually
+  understands, not how much the server can hold. Only a passed probe is stored.
+- Detects silent prompt truncation, and only near the window: far from it a
+  shortfall is our own estimate, not a cut.
+- Continues answers cut by the token limit, stitching without duplicates.
+- Disk-backed tree: `DocTree`, `naviga`, `albero_codice` (lossless AST partition).
+- `trova_fatti`: deterministic scan for codes / IDs / measurements / keys,
+  each with its surrounding sentence.
+
+Some public names are Italian (`trova_fatti`, `contesto`, `invia_adattivo`).
+They are kept as-is for compatibility.
+
+## Install
+
+Python 3.7+. **No runtime dependencies.** On PyPI.
+
+    pip install bocconcini
+
+Offline / Termux — no pip, no build, two files:
+
+    curl -O https://raw.githubusercontent.com/MalgTruevero/bocconcini_crunch/main/bocconcini.py
+    curl -O https://raw.githubusercontent.com/MalgTruevero/bocconcini_crunch/main/bocconcini_tree.py
+
+## First result — no model, no server
+
+    from bocconcini_tree import trova_fatti
+    doc = "filler " * 4000 + "The unlock code is ALFA-1." + "filler " * 4000
+    print(trova_fatti(doc))
+
+Python reads every character and returns the code with its sentence. This is the
+mechanism that found 4/4 hidden codes in 52 s where blind compression found 0/4
+in 42 min, on a Samsung S20 Ultra with a 4B model.
+
+Reproduce it:
+
+    python benchmark_tank.py --no-model   # scan only, no server, milliseconds
+    python benchmark_tank.py              # scan + one model call
+
+Exits 1 if a needle is missed.
+
+Reproduce it:
+
+    python benchmark_tank.py --no-model   # scan only, no server, milliseconds
+    python benchmark_tank.py              # scan + one model call
+
+Exits 1 if a needle is missed.
+
+## With a local server
+
+Needs a running llama.cpp / KoboldCpp server. **Verified live: KoboldCpp only.**
+
+    from bocconcini import LlamaCppClient
+    cl = LlamaCppClient("http://127.0.0.1:5001")
+    print(cl.chat("Answer with one word: ok"))
+
+Ollama and OpenAI-compatible cloud paths are implemented but **not verified live**.
+## Finding facts without blind compression
+
+    from bocconcini_tree import trova_fatti
+    facts = trova_fatti(document)      # reads every character, no model call
+    context = "\n".join(f["contesto"] for f in facts)
+
+Measured on the reference phone, 4 codes hidden in 32,000 characters:
+blind compression 0/4 in 2562 s; trova_fatti 4/4 in 52 s,
+~265 prompt tokens instead of ~10923.
+
+`auto_reduce=True` is **lossy**: it can discard the middle of a document.
+To find facts, use `trova_fatti` or explicit chunking.
+
+## License
+
+MIT. Keeping the name and the story is a courtesy, not a requirement.
+
+## The name
+
+"BOCCONCINI" reads like mozzarella to an English speaker. It is not: it means
+small bites. If you fork and republish, please carry STORIA.md along — a
+courtesy, not a licence requirement.

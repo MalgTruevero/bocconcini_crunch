@@ -1,0 +1,9 @@
+import pathlib, ast
+p = pathlib.Path("bocconcini_tree.py")
+s = p.read_text(encoding="utf-8")
+a = '"calibra_navigazione"]'
+assert s.count(a) == 1, "ancora __all__"
+s = s.replace(a, '"calibra_navigazione", "ask_stepwise"]', 1)
+ast.parse(s)
+p.write_text(s, encoding="utf-8")
+print("ask_stepwise exported")

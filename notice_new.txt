@@ -1,0 +1,3 @@
+@if meta.get("_notice"):
+@@msgs.append({"role": "user", "content": meta.pop("_notice")})
+@final = turn >= hops

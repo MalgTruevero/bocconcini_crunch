@@ -1,0 +1,500 @@
+"""bocconcini 4.0 - split text/Python/JSON into LLM-sized chunks and talk to a
+local llama.cpp / KoboldCpp / Ollama / OpenAI-compatible server.
+
+Standard library only, Python >= 3.7, thread-safe. Born on a Samsung S20 Ultra
+(Termux) and meant to scale up to a normal PC: nothing here is hard-wired to the phone.
+
+What is new in 4.0 (see CHANGELOG at the bottom of this docstring)
+  * Output budget comes from the context window, NOT from generation speed.
+    Speed (measured tokens/s) only drives timeouts and the optional ``target_seconds``.
+  * Answers longer than one turn are finished by tail-continuation: only the
+    incomplete tail is trimmed and regenerated, text is stitched without duplicates.
+  * A model that "reasons but does not act" is handled in layers: tool_choice=required,
+    text tool-call parsing (<tool_call> tags / pure JSON reply), a thinking-off retry when
+    the budget was eaten by reasoning, and one "stop explaining, act" nudge.
+  * Streaming cannot die on a slow prefill: no per-read socket timeout (it breaks the
+    buffered reader in Python); a watchdog thread aborts instead.
+
+Chunking guarantees
+  * every non-whitespace character is covered by at least one chunk (whitespace-only chunks are dropped);
+  * chunks never exceed ``max_chars``; the token limit uses an estimate (or your local counter);
+  * Python is cut at logical-line ends (never inside strings/docstrings/brackets);
+  * JSON is cut outside strings; prose at paragraph > line > sentence > whitespace.
+
+Android/Termux: call from a worker thread, never from the UI thread.
+
+CHANGELOG 4.2.0
+  * JSON no longer torn apart: the old boundary scan capped depth at 2 above 500 KB and gave up
+    above 5 MB, so big/minified documents were cut INSIDE strings (99-100% of the cuts in our
+    stress test). Now every cut is outside strings, at any depth and any size; escapes
+    (\\", \\\\, \\uXXXX) are never split; a document with one giant string is cut at sentences.
+    New kind "jsonish" (single-quoted dict/list repr), JSON Lines and JSON slices are detected.
+    The Python path (tokenize) is untouched, and a test proves it is byte-identical.
+  * Merged from the 13 November file: prefill-aware watchdog patience, opt-in answer spill
+    (BOCCONCINI_SPILL_CHARS), working_budget(reserve).
+
+CHANGELOG 4.1.0
+  * A watchdog abort now really interrupts a blocked read (the raw socket is kept: http.client
+    drops ``conn.sock`` on Connection: close responses, so the old abort did nothing).
+  * A KV-cache hit is no longer reported as a silently truncated prompt (prompt_total is used);
+    with estimated token counts only a drastic shortfall counts.
+  * Continuation no longer re-sends the whole conversation: ``continuation_context``
+    "full" | "light" | "auto" (light = system + cut last user message), smaller tail (<=512 tokens),
+    ``cache_prompt`` for llama.cpp. Too-long histories are trimmed oldest-first before any message
+    content is reduced.
+  * Tokenizer fallback uses the same estimate as everywhere else (was 14% too pessimistic).
+  * ``working_budget()`` for document pipelines; see the companion module bocconcini_docs.
+
+CHANGELOG 4.0.1
+  Fixed (verified on KoboldCpp, Samsung S20 Ultra / Termux):
+    * prompt sizing is now measured, not guessed: the server tokenizer is
+      discovered lazily and used for the content count, and the chat-template
+      overhead is learned per message from usage.prompt_tokens (21 -> 26 tokens
+      of error became 19 vs 20 on the reference device).
+    * tokens no longer collapse to 1 on non-streaming replies without usage.
+    * prefill speed is derived from TTFT when the server sends no timings, with
+      a plausibility ceiling and a pessimistic merge: a KV-cache hit reports the
+      full prompt_n with a near-zero TTFT and must not teach a 100x speed.
+    * silent prompt truncation is detected by comparing what we sent with what
+      the server processed (KoboldCpp truncates and answers anyway), and retries
+      and continuation are skipped in that case instead of wasting minutes.
+    * extract_local and _reduce_text can no longer return an empty context.
+    * a watchdog abort arriving after the last token no longer discards a
+      complete reply.
+    * Ollama: temperature and num_ctx go into ``options`` (top-level temperature
+      was ignored), tool_choice is dropped, model name is filled automatically,
+      and the allocated context is read from /api/ps.
+    * cloud clients consult a learned context window instead of assuming 128k.
+    * ask() lazy client creation is protected by a lock.
+  Docstring corrections: whitespace-only chunks are dropped by design, and
+  on_partial does not cover the tool-argument retry, the action nudge or the
+  internal reduction calls.
+  NOT verified in the field: the Ollama code paths and the cloud context harvest.
+  llama.cpp paths are exercised by the same code but were not run on a live
+  llama-server. Contributions with test output welcome.
+"""
+from __future__ import annotations
+
+import bisect
+from array import array
+import hashlib
+import http.client
+import io
+import ipaddress
+import json
+import logging
+import os
+import re
+import socket
+import ssl
+import subprocess
+import threading
+import time
+import tokenize
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import OrderedDict
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+
+__version__ = "4.2.0"
+__all__ = [
+    "Chunk", "ChatReply", "ModelError", "TokenCounter", "TokenCounterLike",
+    "estimate_tokens", "detect_kind", "iter_chunks", "split_text", "split_thinking", "strip_thinking",
+    "LlamaServerTokenizer", "SystemTemperature", "BatteryTemperature",
+    "check_server_status", "get_model_info", "get_n_ctx", "plan_budget",
+    "calcola_spazio_rimasto", "calcola_timeout_adattivo",
+    "split_text_adaptive", "iter_chunks_adaptive", "invia_adattivo",
+    "extract_local", "parse_tool_calls_from_text",
+    "LlamaCppClient", "OpenAICompatClient", "ask",
+    "lavoro_atomico", "libreria_occupata", "busy_state", "subscribe_busy",
+    "recupera_continuazione_dopo_crash",
+    "DEFAULT_BASE_URL", "FALLBACK_N_CTX",
+]
+
+log = logging.getLogger("bocconcini")
+TokenCounterLike = Callable[[str], int]
+
+DEFAULT_BASE_URL = os.environ.get("BOCCONCINI_BASE_URL", "http://127.0.0.1:8082")
+FALLBACK_N_CTX = 4096
+CTX_MARGIN = 0.92              # fraction of n_ctx we are willing to fill
+MIN_OUT_TOKENS = 64            # below this free space a prompt "does not fit"
+ABS_MAX_TURN_TOKENS = 8192     # default cap for ONE generation turn
+DEFAULT_MAX_TOTAL_TOKENS = 32768
+DEFAULT_MAX_TURNS = 8
+MAX_OUTPUT_CHARS = 400_000
+MAX_REASONING_CHARS = 100_000
+_STREAM_TYPES = ("text/event-stream", "application/x-ndjson", "application/jsonl", "application/json-seq")
+_ACTION_PREFIX = "(Azione):"
+_OPTIONAL_FIELDS = ("stream_options", "tool_choice", "chat_template_kwargs", "think", "cache_prompt")
+
+
+class ModelError(RuntimeError):
+    """Server unreachable, HTTP error, aborted stream or empty answer.
+
+    ``kind`` is one of: connection, http, aborted, stream_interrupted, protocol,
+    context_overflow, empty, busy, server. ``reply`` carries any partial ChatReply.
+    """
+    def __init__(self, message: str = "", reply: Optional["ChatReply"] = None, kind: str = "") -> None:
+        super().__init__(message)
+        self.reply = reply
+        self.kind = kind
+
+
+# ----------------------------------------------------------------------------
+# URLs and small HTTP helpers
+# ----------------------------------------------------------------------------
+def _check_base_url(base_url: str) -> str:
+    b = (base_url or "").strip().rstrip("/")
+    if not b:
+        return DEFAULT_BASE_URL
+    if "://" not in b:
+        b = "http://" + b
+    p = urllib.parse.urlparse(b)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ValueError("base_url must start with http:// or https:// and include a host")
+    return b
+
+
+def _root_url(base_url: str) -> str:
+    b = _check_base_url(base_url)
+    for suf in ("/v1/chat/completions", "/chat/completions", "/api/chat", "/v1"):
+        if b.endswith(suf):
+            return b[: -len(suf)].rstrip("/") or b
+    return b
+
+
+def _is_local(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _http_json(url: str, payload: Optional[dict] = None, timeout: float = 2.0,
+               headers: Optional[dict] = None) -> Any:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    hdrs = {"Accept": "application/json"}
+    if data is not None:
+        hdrs["Content-Type"] = "application/json"
+    hdrs.update(headers or {})
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST" if data is not None else "GET")
+    opener = _NO_PROXY if _is_local(url) else urllib.request.build_opener()
+    with opener.open(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def check_server_status(base_url: str, timeout: float = 3.0) -> str:
+    """'vivo' (any HTTP answer), 'down' (connection refused) or 'irraggiungibile'."""
+    url = _root_url(base_url) + "/v1/models"
+    try:
+        _http_json(url, timeout=timeout)
+        return "vivo"
+    except urllib.error.HTTPError:
+        return "vivo"
+    except ValueError:
+        return "vivo"
+    except urllib.error.URLError as exc:
+        return "down" if isinstance(exc.reason, ConnectionRefusedError) else "irraggiungibile"
+    except Exception:
+        return "irraggiungibile"
+
+
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in value)
+    return str(value)
+
+
+# ----------------------------------------------------------------------------
+# Tokens and "thinking" removal
+# ----------------------------------------------------------------------------
+def _cpt(kind: str) -> float:
+    """Pessimistic chars-per-token (over-counts tokens rather than under-counts)."""
+    return 2.5 if kind in ("json", "jsonish") else 2.8 if kind == "python" else 3.2
+
+
+def estimate_tokens(text: Any, kind: str = "text") -> int:
+    s = _as_text(text)
+    return int(len(s) / _cpt(kind)) + 1 if s else 0
+
+
+def _count(text: str, kind: str, counter: Optional[Any]) -> int:
+    """Count used while chunking. Remote counters are skipped: no HTTP in a hot loop."""
+    if counter is None or getattr(counter, "_is_remote", False):
+        return estimate_tokens(text, kind)
+    try:
+        return max(0, int(counter(text)))
+    except Exception:
+        return estimate_tokens(text, kind)
+
+
+_TAGS = r"(?:think|thinking|thought|reasoning|redacted_thinking)"
+_BLOCK_RE = re.compile(r"<(%s)>(.*?)</\1>" % _TAGS, re.S | re.I)
+_OPEN_RE = re.compile(r"<%s>" % _TAGS, re.I)
+_CLOSE_RE = re.compile(r"</%s>" % _TAGS, re.I)
+
+
+def split_thinking(text: str) -> Tuple[str, str, bool]:
+    """Return (answer, reasoning, truncated).
+
+    Handles closed blocks, a stray closing tag (templates such as Qwen3 open the tag
+    inside the prompt) and an unclosed tag at the very start (= the model ran out of
+    tokens while thinking: ``truncated`` is True and the answer is empty, the reasoning
+    is NEVER passed off as the answer). An unclosed tag in the middle of the text is
+    left alone: it is probably code.
+    """
+    if not text:
+        return "", "", False
+    reasoning: List[str] = []
+
+    def grab(m: "re.Match") -> str:
+        reasoning.append(m.group(2))
+        return ""
+
+    s = _BLOCK_RE.sub(grab, text)
+    truncated = False
+    mo = _OPEN_RE.search(s)
+    if mo and not s[:mo.start()].strip():
+        reasoning.append(s[mo.end():])
+        s, truncated = "", True
+    else:
+        mc = _CLOSE_RE.search(s)
+        if mc and not _OPEN_RE.search(s[:mc.start()]):
+            reasoning.append(s[:mc.start()])
+            s = s[mc.end():]
+    return s.strip(), "\n".join(r.strip() for r in reasoning if r.strip()), truncated
+
+
+def strip_thinking(text: Any) -> str:
+    return split_thinking(_as_text(text))[0]
+
+
+_strip_thinking = strip_thinking
+
+# ----------------------------------------------------------------------------
+# Kind detection and boundaries
+# ----------------------------------------------------------------------------
+_PY_LINE = r"^(?:def |class |import |from \S+ import |@\w)"
+_PY_TOP = ("def ", "class ", "async def ", "@")
+
+
+_DQ_KEY = re.compile(r'"[^"\n]{1,60}"\s*:')
+_SQ_KEY = re.compile(r"'[^'\n]{1,60}'\s*:")
+
+
+def _looks_like_jsonl(text: str) -> bool:
+    head = text[:4000]
+    lines = [ln for ln in head.split("\n") if ln.strip()]
+    if len(text) > 4000:
+        lines = lines[:-1]                      # the last line may be cut by the window
+    if len(lines) < 2 or lines[0].lstrip()[:1] not in ("{", "["):
+        return False
+    for ln in lines[:6]:
+        try:
+            json.loads(ln)
+        except ValueError:
+            return False
+    return True
+
+
+def detect_kind(text: str, name: str = "") -> str:
+    """"python", "json", "jsonish" (single-quoted dict/list repr) or "text"."""
+    low = (name or "").lower()
+    if low.endswith((".py", ".pyi", ".pyw")):
+        return "python"
+    if low.endswith((".json", ".jsonl", ".ndjson")):
+        return "json"
+    head = text[:4000]
+    first = head.lstrip()[:1]
+    if first in ("{", "["):
+        if len(text) <= 200_000:
+            try:
+                json.loads(text)
+                return "json"
+            except ValueError:
+                pass
+            if _looks_like_jsonl(text):
+                return "json"
+        n_sq, n_dq = len(_SQ_KEY.findall(head)), len(_DQ_KEY.findall(head))
+        if n_sq >= 3 and n_sq > n_dq:
+            return "jsonish"
+        if len(text) > 200_000 and head.count('"') >= 2 and (":" in head or "," in head) \
+                and not re.search(_PY_LINE, head, re.M):
+            return "json"
+    # a slice of a bigger JSON document (e.g. a chunk being chunked again)
+    if first in ('{', '[', '"', ',', '}', ']') and len(_DQ_KEY.findall(head)) >= 3 \
+            and not re.search(_PY_LINE, head, re.M):
+        return "json"
+    if len(re.findall(_PY_LINE, head, re.M)) >= 2:
+        return "python"
+    return "text"
+
+
+def _python_boundaries(text: str) -> Optional[List[Tuple[int, int]]]:
+    starts = [0] + [m.end() for m in re.finditer("\n", text)]
+    out: List[Tuple[int, int]] = []
+    at_line_start, decorator = True, False
+    skip = (tokenize.NL, tokenize.COMMENT, tokenize.INDENT, tokenize.DEDENT, tokenize.ENCODING)
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if at_line_start and tok.type not in skip and tok.type != tokenize.NEWLINE:
+                decorator = tok.string == "@"
+                at_line_start = False
+            if tok.type != tokenize.NEWLINE:
+                continue
+            at_line_start = True
+            if decorator:
+                continue
+            row = tok.end[0]
+            if row >= len(starts) or starts[row] >= len(text):
+                continue
+            off = starts[row]
+            rest = text[off:off + 300]
+            body = rest.lstrip()
+            if not body:
+                continue
+            lead = rest[:len(rest) - len(body)]
+            col = len(lead) - (lead.rfind("\n") + 1)
+            head = body
+            while head.startswith("#"):
+                nl = head.find("\n")
+                head = head[nl + 1:].lstrip() if nl != -1 else ""
+            head = head or body
+            prio = (3 if head.startswith(_PY_TOP) else 2) if col == 0 else 1
+            out.append((off, prio))
+    except Exception as exc:
+        log.debug("python tokenize failed (%s); using text boundaries", exc)
+        return None
+    return out
+
+
+def _text_boundaries(text: str) -> List[Tuple[int, int]]:
+    out = [(m.end(), 4) for m in re.finditer(r"\n[ \t]*\n+", text)]
+    out += [(m.end(), 3) for m in re.finditer(r"\n", text)]
+    out += [(m.end(), 2) for m in re.finditer(r"[.!?\u2026][\"'\u00bb\u201d)\]]*[ \t]+", text)]
+    return out
+
+
+# One regex walks the text: a whole string (escapes included) is ONE token that is skipped, so a quote,
+# brace or comma inside a string can never be taken for structure. An unterminated string (a cut
+# document) runs to the end of the text instead of flipping the state for everything after it.
+_JSON_TOK = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\Z)|[\[\]{},\n]', re.S)
+_JSONISH_TOK = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\Z)|\'[^\'\\]*(?:\\.[^\'\\]*)*(?:\'|\Z)|[\[\]{},\n]',
+                          re.S)
+
+
+def _json_boundaries(text: str, loose: bool = False) -> Tuple[Any, Any]:
+    """Cut points OUTSIDE strings, at every depth: after a comma or a newline.
+
+    Priority is -depth, so iter_chunks prefers the shallowest cut that fits (between records before
+    between fields). No depth cap, no size cap: the old caps (depth 2 above 500 KB, nothing above
+    5 MB) pushed big documents onto plain-text cuts, in the middle of strings.
+    ``loose=True`` also understands single-quoted strings (Python/JS dict repr).
+    """
+    offs, prios = array("q"), array("b")
+    depth = 0
+    for m in (_JSONISH_TOK if loose else _JSON_TOK).finditer(text):
+        c = text[m.start()]
+        if c == '"' or c == "'":
+            continue
+        if c == "{" or c == "[":
+            depth += 1
+        elif c == "}" or c == "]":
+            depth = depth - 1 if depth > 0 else 0
+        else:
+            offs.append(m.end())
+            prios.append(-min(depth, 127))
+    return offs, prios
+
+
+def _boundaries(text: str, kind: str) -> Tuple[Any, Any]:
+    if kind in ("json", "jsonish"):
+        offs, prios = _json_boundaries(text, loose=(kind == "jsonish"))
+        if len(offs) >= 3 or len(text) <= 2000:
+            return offs, prios
+        # (almost) no structure: one giant string. Cut it at sentences/words, not at random.
+    pairs: Optional[List[Tuple[int, int]]] = None
+    if kind == "python":
+        pairs = _python_boundaries(text)
+    if pairs is None:
+        pairs = _text_boundaries(text)
+    pairs.sort()
+    return [o for o, _ in pairs], [p for _, p in pairs]
+
+
+def _escape_safe(text: str, pos: int, floor: int) -> int:
+    """Move a cut that falls inside a JSON string back so it never splits ``\\"``, ``\\\\`` or ``\\uXXXX``."""
+    p = pos
+    while p > floor + 1:
+        j, run = p, 0
+        while j > 0 and text[j - 1] == "\\":
+            run += 1
+            j -= 1
+        if run % 2 == 1:                          # the previous char starts an escape
+            p -= 1
+            continue
+        moved = False
+        for idx in range(p - 1, max(floor, p - 6), -1):
+            if text[idx] == "u" and idx > 0 and text[idx - 1] == "\\" and p - idx - 1 < 4:
+                k, run = idx - 1, 0
+                while k >= 0 and text[k] == "\\":
+                    run += 1
+                    k -= 1
+                if run % 2 == 1:                  # a real \uXXXX cut before its 4th hex digit
+                    p = idx - 1
+                    moved = True
+                break
+        if not moved:
+            break
+    return p if p > floor else pos
+
+
+def _soft_cut(text: str, a: int, hard_end: int, kind: str) -> int:
+    """No structural boundary in the window. JSON: we are inside a long string -> sentence, then word,
+    never inside an escape. Anything else: whitespace."""
+    if kind in ("json", "jsonish"):
+        for pat in (". ", "! ", "? ", "; ", ", ", " "):
+            k = text.rfind(pat, a, hard_end)
+            if k != -1:
+                return _escape_safe(text, k + len(pat), a)
+        return _escape_safe(text, hard_end, a)
+    k = max(text.rfind(" ", a, hard_end), text.rfind("\n", a, hard_end))
+    return k + 1 if k >= a else hard_end
+
+
+# ----------------------------------------------------------------------------
+# Thermal guard (battery temperature, never blocks the caller)
+# ----------------------------------------------------------------------------
+_BATTERY_PATHS = ("/sys/class/power_supply/battery/temp", "/sys/class/power_supply/Battery/temp",
+                  "/sys/class/power_supply/BAT0/temp", "/sys/class/power_supply/BAT1/temp")
+_TEMP_NUM = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _normalizza_temperatura(raw: Any) -> Optional[float]:
+    """Tolerant to degrees, tenths, hundredths and thousandths (Samsung One UI quirk)."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        v = float(raw)
+    elif isinstance(raw, str):
+        m = _TEMP_NUM.search(raw)
+        if not m:
+            return None
+        v = float(m.group(0))
+    else:
+        return None

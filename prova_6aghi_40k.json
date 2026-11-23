@@ -1,0 +1,99 @@
+{
+  "server": {
+    "result": "KoboldCpp",
+    "version": "1.124.2",
+    "protected": false,
+    "llm": true,
+    "txt2img": false,
+    "vision": false,
+    "audio": false,
+    "transcribe": false,
+    "multiplayer": false,
+    "websearch": false,
+    "tts": false,
+    "embeddings": true,
+    "music": false,
+    "musicllm": false,
+    "musicfamily": "none",
+    "savedata": false,
+    "admin": 0,
+    "router": false,
+    "guidance": false,
+    "jinja": true,
+    "mcp": false,
+    "parallelrequests": 1,
+    "defaults_modified": false
+  },
+  "models": {
+    "object": "list",
+    "data": [
+      {
+        "id": "koboldcpp/smol-tools-4b-16k-q4_k_m",
+        "object": "model",
+        "created": 1795170180,
+        "owned_by": "koboldcpp",
+        "status": {
+          "value": "loaded"
+        },
+        "permission": [],
+        "root": "koboldcpp"
+      }
+    ]
+  },
+  "device": "Android-13-aarch64-64bit-ELF",
+  "machine": "aarch64",
+  "python": "3.14.10",
+  "n_ctx": 4096,
+  "cognitive_limit": null,
+  "model_info": {
+    "n_ctx": 4096,
+    "model": "smol-tools-4b-16k-q4_k_m",
+    "type": "small-8k",
+    "base_url": "http://127.0.0.1:8082",
+    "detected": true,
+    "source": "server"
+  },
+  "doc_chars": 131383,
+  "doc_tokens_est": 41058,
+  "ratio_vs_n_ctx": 10.02,
+  "needles": [
+    "ALFA-1",
+    "BETA-7",
+    "KAPPA-5",
+    "OMEGA-9",
+    "SIGMA-2",
+    "TITANO-3"
+  ],
+  "found": [],
+  "n_found": 0,
+  "seconds": 1226.4,
+  "meta": {
+    "hops": 6,
+    "nodes_read": [
+      "sec_007",
+      "sec_047",
+      "sec_089"
+    ],
+    "evicted": 9,
+    "repeats": 0,
+    "branches_cut": [],
+    "unknown_ids": [
+      "sec_134"
+    ],
+    "forced_answer": false,
+    "answered_from_index": false,
+    "stopped": "budget: prompt ~2256 > 2000",
+    "budget": 2000,
+    "deferred": 2,
+    "searches": [
+      "codice batteria",
+      "codice password database",
+      "codice satellite",
+      "codice backup",
+      "codice cassaforte",
+      "codice firmware"
+    ],
+    "nudged": true
+  },
+  "answer": ""
+}

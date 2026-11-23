@@ -1321,7 +1321,7 @@ def _tools_tokens(client, tools):
     if not tools:
         return 0
     s = json.dumps(tools, ensure_ascii=False)
-    return int(client._exact_content(s) or (len(s) / 2.5 + 1))
+    return int(getattr(client,"_exact_content",lambda x:0)(s) or (len(s) / 2.5 + 1))
 
 def _fit_batches(wins, room):
     """Pack windows into batches that fit room tokens. Nothing is dropped."""

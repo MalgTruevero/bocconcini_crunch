@@ -1,0 +1,253 @@
+        others = self._prompt_tokens([m for i, m in enumerate(msgs) if i != big])
+        target = max(200, budget - others)
+        if question:
+            core, tail = text, "\n\nRequest: " + question
+        elif len(text) > 2000:
+            core, tail = text[:-600], "\n\n[REQUEST]\n" + text[-600:]      # instructions usually sit at the end
+        else:
+            core, tail = text, ""
+        q = question or text[-600:]
+        reduced = self._reduce_text(core, q, max(100, target - estimate_tokens(tail)))
+        log.warning("prompt reduced: ~%d -> ~%d tokens", estimate_tokens(text), estimate_tokens(reduced + tail))
+        meta["reduced"] = True
+        out = [dict(m) for m in msgs]
+        out[big]["content"] = "[CONTEXT - reduced to fit the model]\n" + reduced + tail
+        return out
+
+    # -- public API ----------------------------------------------------------
+    def _spill(self, reply: ChatReply) -> None:
+        """Write a long answer to disk so the caller can hold a path, not the text.
+
+        Opt-in: BOCCONCINI_SPILL_CHARS (absent or 0 = off), BOCCONCINI_SPILL_DIR.
+        Never raises: an I/O problem must not destroy an answer already produced.
+        """
+        try:
+            limit = int(os.environ.get("BOCCONCINI_SPILL_CHARS") or 0)
+        except ValueError:
+            return
+        if limit <= 0 or not reply.text or len(reply.text) < limit:
+            return
+        try:
+            env = os.environ.get("BOCCONCINI_SPILL_DIR")
+            if env:
+                folder = Path(env).expanduser()
+            else:
+                prof = _profile_path()
+                folder = (prof.parent if prof is not None else Path.home() / ".cache" / "bocconcini") / "spill"
+            folder.mkdir(parents=True, exist_ok=True)
+            tag = hashlib.blake2b(reply.text.encode("utf-8", "replace"), digest_size=4).hexdigest()
+            name = "spill_%s_%d_%s.txt" % (time.strftime("%Y%m%d_%H%M%S"), os.getpid(), tag)
+            target, tmp = folder / name, folder / (name + ".tmp")
+            tmp.write_text(reply.text, encoding="utf-8")
+            os.replace(str(tmp), str(target))
+            reply.meta["spill_path"] = str(target)
+            reply.meta["spill_chars"] = len(reply.text)
+            reply.spill_path = str(target)
+            log.info("answer spilled to %s (%d chars)", target, len(reply.text))
+        except Exception as exc:
+            log.warning("cannot spill the answer (%s): keeping it in memory", exc)
+
+    def chat_full(self, prompt: str = "", system: str = "", temperature: float = 0.7, *,
+                  messages: Optional[List[Dict[str, Any]]] = None,
+                  tools: Optional[List[Dict[str, Any]]] = None, max_tokens: Optional[int] = None,
+                  thinking: Optional[bool] = None, strip_thinking: bool = True, force_action: bool = False,
+                  extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, stream: bool = True,
+                  auto_reduce: Optional[bool] = None, continua: bool = True,
+                  on_partial: Optional[Callable[[str], None]] = None, blocca_altri: bool = True,
+                  timeout_attesa: Optional[float] = None, tool_choice: Any = None,
+                  max_total_tokens: int = DEFAULT_MAX_TOTAL_TOKENS, max_turns: int = DEFAULT_MAX_TURNS,
+                  continuation_context: str = "auto",
+                  action_validator: Optional[Callable[[ChatReply], bool]] = None, act_retries: int = 1,
+                  reduce_question: Optional[str] = None) -> ChatReply:
+        """One chat request with budgeting, continuation and action enforcement.
+
+        ``max_tokens`` caps ONE turn; ``max_total_tokens``/``max_turns`` cap the continuation.
+        ``force_action``: the model must act (tool call). Uses tool_choice=required when ``tools``
+        are given, parses text tool calls, and nudges once. ``action_validator(reply)->bool`` lets
+        you define "acted" for your own text protocol. ``on_partial`` receives live text deltas
+        (main turn, thinking-off retry and continuations; not the tool-argument retry, the action nudge or the internal reduction calls); the returned ``reply.text`` is authoritative.
+        """
+        if messages:
+            msgs = [dict(m) for m in messages]
+        else:
+            if not prompt:
+                raise ValueError("pass a prompt or messages")
+            msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+        if force_action:
+            if msgs and msgs[0].get("role") == "system":
+                msgs[0]["content"] = _as_text(msgs[0].get("content")) + "\n\n" + self.action_hint
+            else:
+                msgs.insert(0, {"role": "system", "content": self.action_hint})
+        c = _Call(msgs, temperature, tools, tool_choice, max_tokens, max_total_tokens, max_turns, thinking,
+                  bool(strip_thinking), extra, timeout, bool(stream), on_partial, continua,
+                  continuation_context)
+        with lavoro_atomico(self.base_url, blocca_altri=blocca_altri, timeout_attesa=timeout_attesa):
+            reply = self._run(c, force_action, action_validator, act_retries, auto_reduce, reduce_question)
+        self._spill(reply)
+        return reply
+
+    def _run(self, c: _Call, force_action: bool, validator: Optional[Callable[[ChatReply], bool]],
+             act_retries: int, auto_reduce: Optional[bool], reduce_question: Optional[str]) -> ChatReply:
+        meta: Dict[str, Any] = {}
+        if self.flavor != "openai":
+            info = self._info()
+        elif self.n_ctx:
+            info = {"n_ctx": int(self.n_ctx), "detected": True, "source": "user"}
+        else:
+            # Cloud APIs do not advertise their window. Use what a previous
+            # overflow error taught us, if anything; otherwise assume wide and
+            # say so, instead of pretending the budget guard verified it.
+            with _MODEL_LOCK:
+                hit = _MODEL_CACHE.get(_check_base_url(self.base_url))
+            info = (dict(hit[1]) if hit and hit[1].get("detected")
+                    else {"n_ctx": 128000, "detected": False, "source": "assumed"})
+        n_ctx = info["n_ctx"]
+        meta.update({"n_ctx": n_ctx, "n_ctx_detected": info.get("detected", False)})
+        tools_tokens = estimate_tokens(json.dumps(c.tools, ensure_ascii=False), "json") if c.tools else 0
+        msgs = c.msgs
+        ptoks = self._prompt_tokens(msgs, tools_tokens)
+        plan = self._plan(c, n_ctx, ptoks)
+        want = min(256, c.max_tokens or 256)
+        reduce_on = self.auto_reduce if auto_reduce is None else bool(auto_reduce)
+        if plan["free"] < want and reduce_on:
+            reserve = min(max(c.max_tokens or 1024, 512), plan["usable"] // 2)
+            msgs = self._reduce_messages(msgs, plan["usable"] - reserve - tools_tokens, reduce_question, meta)
+            plan = self._plan(c, n_ctx, self._prompt_tokens(msgs, tools_tokens))
+        # The nominal window is not the usable one: a small model can hold every
+        # token and still lose the thread. Nothing else here can see it, because
+        # the server raises no error and the answer is simply wrong. Above the
+        # provisional size we consult the measured window (cached, one calibration
+        # per model + n_ctx). Refusing is the point: better late than wrong.
+        ptoks_now = plan["usable"] - plan["free"]
+        cog = 0
+        if (os.environ.get("BOCCONCINI_NO_COGNITIVE") != "1"
+                and ptoks_now > self._COG_PROVISIONAL):
+            cog = self._cognitive_limit(n_ctx)
+        if cog:
+            meta["cognitive_limit"] = cog
+            if ptoks_now > cog:
+                raise ModelError(
+                    "the prompt (~%d tokens) fits n_ctx=%d but exceeds this model\'s "
+                    "measured cognitive window (%d tokens): the answer would not be "
+                    "reliable. Split the task into smaller pieces." % (ptoks_now, n_ctx, cog),
+                    kind="cognitive_overflow")
+        if not plan["fits"]:
+            raise ModelError("the prompt (~%d tokens) does not fit n_ctx=%d%s" % (
+                self._prompt_tokens(msgs, tools_tokens), n_ctx, "" if info.get("detected") else
+                " (n_ctx was NOT detected; pass n_ctx=... if the real one is larger)"), kind="context_overflow")
+        acting = force_action and bool(c.tools) and msgs[-1].get("role") != "tool"
+        tool_choice = c.tool_choice or ("required" if acting else None)
+        reply = self._generate(c, msgs, n_ctx, tools_tokens, tool_choice, meta)
+        reply = self._ensure_action(c, msgs, reply, force_action, validator, act_retries, n_ctx, tools_tokens, meta)
+        t = reply.text
+        if t[:len(_ACTION_PREFIX)].lower() == _ACTION_PREFIX.lower():
+            reply.text = t[len(_ACTION_PREFIX):].strip()
+        reply.ha_json_nel_testo, reply.json_nel_testo = _json_in_text(reply.text)
+        reply.meta.update(meta)
+        if not reply.text and not reply.tool_calls:
+            what = "only reasoning (finish_reason=%s)" % reply.finish_reason if reply.reasoning else "nothing"
+            raise ModelError("the model returned %s; raw start: %r" % (what, reply.meta.get("raw_start", "")[:120]),
+                             reply=reply, kind="empty")
+        return reply
+
+    def chat(self, prompt: str, system: str = "", temperature: float = 0.7, **options: Any) -> str:
+        return self.chat_full(prompt, system, temperature, **options).text
+
+    ask = chat
+
+
+class OpenAICompatClient(LlamaCppClient):
+    """Client for OpenAI-compatible cloud APIs (base_url should end with /v1)."""
+    flavor = "openai"
+
+    def __init__(self, base_url: str = "https://api.openai.com/v1", api_key: str = "",
+                 model: str = "gpt-4o-mini", timeout: Optional[float] = None, **kwargs: Any) -> None:
+        super().__init__(base_url=base_url, model=model, timeout=timeout, api_key=api_key, **kwargs)
+
+    def _chat_urls(self) -> List[str]:
+        b = self.base_url.rstrip("/")
+        return [b] if b.endswith("/chat/completions") else [_root_url(b) + "/v1/chat/completions"
+                                                            if not b.endswith("/v1") else b + "/chat/completions"]
+
+
+_DEFAULT_CLIENT: List[Optional[LlamaCppClient]] = [None]
+_DEFAULT_CLIENT_LOCK = threading.Lock()
+
+
+def ask(prompt: str, system: str = "", temperature: float = 0.7, **options: Any) -> str:
+    cl = options.pop("client", None)
+    if cl is None:
+        with _DEFAULT_CLIENT_LOCK:
+            if _DEFAULT_CLIENT[0] is None:
+                _DEFAULT_CLIENT[0] = LlamaCppClient()
+            cl = _DEFAULT_CLIENT[0]
+    return cl.chat(prompt, system, temperature, **options)
+
+
+# ----------------------------------------------------------------------------
+# Adaptive chunking (size comes from the model context)
+# ----------------------------------------------------------------------------
+def _adaptive_params(text: str, prompt_base: str, base_url: str, name: str, kind: Optional[str],
+                     max_chars: int, margine: float, token_counter: Optional[Any],
+                     n_ctx: Optional[int]) -> Tuple[str, Dict[str, Any], int]:
+    kind = kind or detect_kind(text, name)
+    info = calcola_spazio_rimasto(prompt_base, base_url, margine, token_counter, kind, n_ctx=n_ctx)
+    eff = max(200, min(max_chars, int(info["spazio_per_pezzo"] * _cpt(kind))))
+    return kind, info, eff
+
+
+def iter_chunks_adaptive(text: str, prompt_base: str, base_url: str = DEFAULT_BASE_URL, name: str = "text", *,
+                         kind: Optional[str] = None, max_chars: int = 3000, min_chars: int = 300,
+                         overlap: int = 120, token_counter: Optional[Any] = None,
+                         temperature_provider: Optional[Callable[[], float]] = None,
+                         margine_sicurezza: float = 0.85, n_ctx: Optional[int] = None) -> Iterator[Chunk]:
+    kind, info, eff = _adaptive_params(text, prompt_base, base_url, name, kind, max_chars,
+                                       margine_sicurezza, token_counter, n_ctx)
+    yield from iter_chunks(text, name, kind=kind, max_chars=eff, max_tokens=info["spazio_per_pezzo"],
+                           min_chars=min_chars, overlap=overlap, token_counter=token_counter,
+                           temperature_provider=temperature_provider)
+
+
+def split_text_adaptive(text: str, prompt_base: str, base_url: str = DEFAULT_BASE_URL, name: str = "text",
+                        **options: Any) -> List[Chunk]:
+    return list(iter_chunks_adaptive(text, prompt_base, base_url, name, **options))
+
+
+def invia_adattivo(testo_completo: str, prompt_base: str, base_url: str = DEFAULT_BASE_URL, name: str = "text",
+                   on_chunk: Optional[Callable[[Chunk, Dict[str, Any], Dict[str, Any]], Any]] = None, *,
+                   kind: Optional[str] = None, max_chars: int = 3000, min_chars: int = 300, overlap: int = 120,
+                   token_counter: Optional[Any] = None,
+                   temperature_provider: Optional[Callable[[], float]] = None,
+                   margine_sicurezza: float = 0.85, n_ctx: Optional[int] = None,
+                   verifica_esatta: bool = False) -> Tuple[List[Chunk], Dict[str, Any], List[Any]]:
+    """Split to fit the model and call ``on_chunk(chunk, meta, info)`` for each piece.
+
+    No piece limit. ``verifica_esatta=True`` asks the tokenizer for each chunk (one HTTP call per chunk).
+    """
+    kind, info, eff = _adaptive_params(testo_completo, prompt_base, base_url, name, kind, max_chars,
+                                       margine_sicurezza, token_counter, n_ctx)
+    limit = info["spazio_per_pezzo"]
+    chunks = list(iter_chunks(testo_completo, name, kind=kind, max_chars=eff, max_tokens=limit,
+                              min_chars=min_chars, overlap=overlap, token_counter=token_counter,
+                              temperature_provider=temperature_provider))
+    results: List[Any] = []
+    for i, ch in enumerate(chunks):
+        estimated = _count(ch.text, ch.kind, token_counter)
+        exact: Optional[int] = None
+        if verifica_esatta and hasattr(token_counter, "count_exact"):
+            try:
+                exact = int(token_counter.count_exact(ch.text))
+            except Exception as exc:
+                log.debug("count_exact failed for chunk %d: %s", i, exc)
+        tokens = exact if exact is not None else estimated
+        over = tokens > limit
+        if over:
+            log.warning("chunk %d has %d tokens > limit %d", i, tokens, limit)
+        meta = {"chunk_index": i, "total_chunks": len(chunks), "is_part_of": "%d/%d" % (i + 1, len(chunks)),
+                "tokens": tokens, "tokens_estimated": estimated, "tokens_exact": exact,
+                "exact_checked": exact is not None, "n_ctx": info["n_ctx"], "limite": limit,
+                "prompt_base_tokens": info["prompt_base_tokens"], "over_limit": over}
+        if on_chunk:
+            results.append(on_chunk(ch, meta, info))
+    return chunks, info, results
+

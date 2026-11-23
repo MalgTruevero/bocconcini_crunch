@@ -1,0 +1,8 @@
+@elif reads_turn and _msg_tokens(msgs, cpt) + int(min(cap, int(valid.get(nid, {}).get("chars") or cap)) / cpt) + 8 > max(200, budget - 256):
+@@meta["deferred"] = meta.get("deferred", 0) + 1
+@@body = ("[branch %s NOT read: this turn already carries %d branch(es). "
+@@        "Ask for it again on the next turn.]" % (nid, reads_turn))
+@else:
+@@reads_turn += 1
+@@try:
+@@@full = tree.load(session, nid)

@@ -1,0 +1,8 @@
+{"test": "1_CIAO", "stato": "PASS", "dettaglio": "len=214 tempo=88.7s testo='# Ciao! 👋\\n\\n# I apologize, but I need to clarify something important:\\n\\n# Hello! I' mem=30.3MB"}
+{"test": "2_BOMBA_PROMPT_8K", "stato": "PASS", "dettaglio": "prompt_len=9695 out_len=3809 tempo=865.0s mem=30.4MB"}
+{"test": "3_MARATONETA_2048tok", "stato": "PASS", "dettaglio": "out_len=15911 tempo=1930.7s char/s=8.2 mem=30.4MB"}
+{"test": "4_SPILL_GIGANTE", "stato": "PASS", "dettaglio": "out_len=2909 tempo=240.0s mem=30.4MB spill_files=[]"}
+{"test": "5_RAFFICA_10X", "stato": "PASS", "dettaglio": "riuscite=10/10 tempo_tot=1785.6s mem=30.4MB"}
+{"test": "6_JSON_SPORCO", "stato": "PASS", "dettaglio": "testo='{\"parla\": \"Ciao, sono MALG\"}' meta={}"}
+{"test": "7_CONTESTO_OLTRE_4096", "stato": "FAIL", "dettaglio": "prompt_len=12000 out_len=0 mem=30.4MB"}
+{"test": "8_BUSY_GATE_DOPPIO", "stato": "CHECK", "dettaglio": "risultati={} - Se A e B sono entrambi >0 e non mischiati, Busy Gate ha funzionato. Se uno e 0 o mischiato, da guardare."}

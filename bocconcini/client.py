@@ -1147,7 +1147,7 @@ def _load_parallel_cache(base_url: str) -> Optional[int]:
     """Load cached parallel capacity from hardware_profile.json."""
     try:
         from pathlib import Path
-        cache_file = Path.home() / ".cache" / "bocconcini" / "hardware_profile.json"
+        cache_file = Path.home() / ".cache" / "bocconcini" / "parallel_cache.json"
         if cache_file.exists():
             import json
             data = json.loads(cache_file.read_text())
@@ -1158,16 +1158,18 @@ def _load_parallel_cache(base_url: str) -> Optional[int]:
     return None
 
 def _save_parallel_cache(base_url: str, capacity: int) -> None:
-    """Save parallel capacity to hardware_profile.json."""
+    """Save parallel capacity to parallel_cache.json."""
     try:
         from pathlib import Path
-        cache_file = Path.home() / ".cache" / "bocconcini" / "hardware_profile.json"
+        import json, os, threading
+        cache_file = Path.home() / ".cache" / "bocconcini" / "parallel_cache.json"
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        import json
         data = json.loads(cache_file.read_text()) if cache_file.exists() else {}
         key = base_url.rstrip("/").lower()
         data[key + "_parallel"] = capacity
-        cache_file.write_text(json.dumps(data, indent=2))
+        tmp = cache_file.with_name(cache_file.name + ".tmp.%d.%d" % (os.getpid(), threading.get_ident()))
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(str(tmp), str(cache_file))
     except Exception:
         pass
 
@@ -1234,9 +1236,11 @@ def lavoro_atomico(base_url: str = "", blocca_altri: bool = True, timeout_attesa
     key = _lock_key(base_url)
     with _GATE_MUTEX:
         cached = _load_parallel_cache(base_url)
-        if cached is None:
-            cached = _probe_parallelism(base_url)
+    if cached is None:
+        cached = _probe_parallelism(base_url)
+        with _GATE_MUTEX:
             _save_parallel_cache(base_url, cached)
+    with _GATE_MUTEX:
         lk = _GATES.setdefault(key, _ReentrantSemaphore(cached))
     if not lk.acquire(timeout=-1 if timeout_attesa is None else float(timeout_attesa)):
         raise ModelError("another job is still running on %s" % key, kind="busy")
@@ -2891,13 +2895,36 @@ class OpenAICompatClient(LlamaCppClient):
 _DEFAULT_CLIENT: List[Optional[LlamaCppClient]] = [None]
 _DEFAULT_CLIENT_LOCK = threading.Lock()
 
+_DEFAULT_CLIENT_CONFIG: Optional[Dict[str, Any]] = None
+_DEFAULT_CLIENT_CONFIG_LOCK = threading.Lock()
+
+
+def _load_default_client_config() -> Dict[str, Any]:
+    """Load default client settings from ~/.config/bocconcini/config.json (read once, cached)."""
+    global _DEFAULT_CLIENT_CONFIG
+    with _DEFAULT_CLIENT_CONFIG_LOCK:
+        if _DEFAULT_CLIENT_CONFIG is None:
+            _DEFAULT_CLIENT_CONFIG = {}
+            try:
+                from pathlib import Path
+                cfg_file = Path.home() / ".config" / "bocconcini" / "config.json"
+                if cfg_file.exists():
+                    import json
+                    loaded = json.loads(cfg_file.read_text())
+                    if isinstance(loaded, dict):
+                        _DEFAULT_CLIENT_CONFIG = loaded
+            except Exception as exc:
+                log.warning("cannot read bocconcini config: %s", exc)
+        return _DEFAULT_CLIENT_CONFIG
+
+
 
 def ask(prompt: str, system: str = "", temperature: float = 0.7, **options: Any) -> str:
     cl = options.pop("client", None)
     if cl is None:
         with _DEFAULT_CLIENT_LOCK:
             if _DEFAULT_CLIENT[0] is None:
-                _DEFAULT_CLIENT[0] = LlamaCppClient()
+                _DEFAULT_CLIENT[0] = LlamaCppClient(**_load_default_client_config())
             cl = _DEFAULT_CLIENT[0]
     return cl.chat(prompt, system, temperature, **options)
 

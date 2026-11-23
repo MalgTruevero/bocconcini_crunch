@@ -1,0 +1,500 @@
+    if v >= 10000:
+        v /= 1000.0
+    elif v > 1000:
+        v /= 100.0
+    elif v > 100:
+        v /= 10.0
+    return v if -20 < v < 120 else None
+
+
+def _read_temp_file(path: str) -> Optional[float]:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return _normalizza_temperatura(fh.read().strip())
+    except OSError:
+        return None
+
+
+def _battery_temp_once(timeout: float = 2.0) -> Optional[float]:
+    for p in _BATTERY_PATHS:
+        t = _read_temp_file(p)
+        if t is not None:
+            return t
+    try:
+        out = subprocess.run(["termux-battery-status"], capture_output=True, text=True, timeout=timeout,
+                             close_fds=True, encoding="utf-8", errors="replace").stdout
+        return _normalizza_temperatura(json.loads(out).get("temperature"))
+    except Exception as exc:
+        log.debug("battery temperature unavailable: %s", exc)
+        return None
+
+
+class SystemTemperature:
+    """Callable returning the (cached) temperature; the sensor is read in a background thread."""
+    def __init__(self, ttl: float = 15.0, default: float = 30.0, timeout: float = 2.0,
+                 reader: Optional[Callable[[float], Optional[float]]] = None) -> None:
+        self._ttl, self._timeout = ttl, timeout
+        self._reader = reader or _battery_temp_once
+        self._value = default
+        self._checked = float("-inf")
+        self._started = 0.0
+        self._busy = False
+        self._gen = 0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        now = time.monotonic()
+        gen = 0
+        with self._lock:
+            value = self._value
+            stuck = self._busy and now - self._started > 30.0
+            start = stuck or (not self._busy and now - self._checked >= self._ttl)
+            if start:
+                self._busy, self._started = True, now
+                self._gen += 1
+                gen = self._gen
+        if start:
+            try:
+                threading.Thread(target=self._refresh, args=(gen,), daemon=True, name="bocconcini-thermal").start()
+            except (RuntimeError, OSError) as exc:
+                log.debug("cannot start thermal thread: %s", exc)
+                with self._lock:
+                    self._busy, self._checked = False, now
+        return value
+
+    def _refresh(self, gen: int) -> None:
+        temp: Optional[float] = None
+        try:
+            temp = self._reader(self._timeout)
+        except Exception as exc:
+            log.debug("temperature read failed: %s", exc)
+        with self._lock:
+            if gen != self._gen:
+                return
+            if temp is not None and -20 < temp < 120:
+                self._value = temp
+            self._checked = time.monotonic()
+            self._busy = False
+
+
+BatteryTemperature = SystemTemperature
+
+
+def _thermal_scale(provider: Optional[Callable[[], float]]) -> float:
+    if provider is None:
+        return 1.0
+    try:
+        t = float(provider())
+    except Exception:
+        return 1.0
+    return 0.4 if t >= 47 else 0.55 if t >= 45 else 0.7 if t >= 42 else 0.85 if t >= 40 else 1.0
+
+
+# ----------------------------------------------------------------------------
+# Chunking
+# ----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Chunk:
+    """A [start, end) slice of ``source``; text is copied only when ``.text`` is read."""
+    source: str = field(repr=False)
+    start: int = 0
+    end: int = 0
+    kind: str = "text"
+
+    @property
+    def text(self) -> str:
+        return self.source[self.start:self.end]
+
+    def __len__(self) -> int:
+        return self.end - self.start
+
+    def token_count_estimate(self, kind: Optional[str] = None) -> int:
+        return estimate_tokens(self.text, kind or self.kind)
+
+
+def _shrink(start: int, end: int, tokens: int, max_tokens: int) -> int:
+    length = end - start
+    if length <= 1 or tokens <= 0:
+        return end
+    new = int(length * max_tokens / tokens * 0.95)
+    new = min(new, length - max(1, length // 10))
+    return start + max(1, new)
+
+
+def _fit_tokens(text: str, start: int, end: int, max_tokens: int, counter: Optional[Any], kind: str) -> int:
+    for _ in range(6):
+        if end - start <= 1:
+            break
+        tokens = _count(text[start:end], kind, counter)
+        if tokens <= max_tokens:
+            break
+        end = _shrink(start, end, tokens, max_tokens)
+    return end
+
+
+def iter_chunks(text: str, name: str = "text", *, kind: Optional[str] = None, max_chars: int = 3000,
+                max_tokens: int = 800, min_chars: int = 300, overlap: int = 120,
+                token_counter: Optional[Any] = None,
+                temperature_provider: Optional[Callable[[], float]] = None) -> Iterator[Chunk]:
+    if max_chars < 1 or max_tokens < 1 or overlap < 0 or min_chars < 0:
+        raise ValueError("max_chars/max_tokens must be >= 1, overlap/min_chars >= 0")
+    if not text:
+        return
+    kind = kind or detect_kind(text, name)
+    offs, prios = _boundaries(text, kind)
+    n, start = len(text), 0
+    while start < n:
+        scale = _thermal_scale(temperature_provider)
+        eff_chars = max(50, int(max_chars * scale))
+        eff_tokens = max(20, int(max_tokens * scale))
+        min_c = max(1, min(min_chars, eff_chars // 2))
+        hard_end = _fit_tokens(text, start, min(n, start + eff_chars), eff_tokens, token_counter, kind)
+        if hard_end >= n:
+            end = n
+        else:
+            lo = bisect.bisect_left(offs, start + min_c)
+            hi = bisect.bisect_right(offs, hard_end)
+            if lo >= hi:
+                if kind in ("json", "jsonish") and hi > 0 and offs[hi - 1] > start:
+                    end = offs[hi - 1]            # a real cut closer than min_chars beats a cut inside a string
+                else:
+                    end = _soft_cut(text, start + min_c, hard_end, kind)
+            else:
+                # best boundary inside the last 30% of the window; else simply the latest one
+                near = start + max(min_c, int((hard_end - start) * 0.7))
+                best = None
+                for i in range(hi - 1, lo - 1, -1):
+                    if offs[i] < near:
+                        break
+                    if best is None or prios[i] > prios[best]:
+                        best = i
+                end = offs[best] if best is not None else offs[hi - 1]
+        if kind in ("json", "jsonish"):
+            end = _escape_safe(text, end, start)
+        end = max(end, start + 1)
+        if text[start:end].strip():
+            yield Chunk(text, start, end, kind)
+        if end >= n:
+            return
+        nxt = end
+        if overlap:
+            target = max(end - overlap, start + (end - start + 1) // 2)
+            i = bisect.bisect_left(offs, target)
+            if i < len(offs) and offs[i] < end:
+                nxt = offs[i]
+            elif kind == "text":
+                k = text.find(" ", target, end)
+                if k != -1:
+                    nxt = k + 1
+        start = nxt
+
+
+def split_text(text: str, name: str = "text", **options: Any) -> List[Chunk]:
+    return list(iter_chunks(text, name, **options))
+
+
+# ----------------------------------------------------------------------------
+# Hardware profile: measured speed per (server, model), saved atomically, reused 24h
+# ----------------------------------------------------------------------------
+_PROFILE_TTL = 24 * 3600
+_PROFILE_LOCK = threading.Lock()
+_PROFILE_MEM: Dict[str, Dict[str, float]] = {}
+_PROFILE_STATE = {"loaded": False}
+
+
+def _profile_path() -> Optional[Path]:
+    env = os.environ.get("BOCCONCINI_PROFILE")
+    if env is not None:
+        return Path(env) if env else None          # BOCCONCINI_PROFILE="" disables persistence
+    try:
+        return Path.home() / ".cache" / "bocconcini" / "hardware_profile.json"
+    except Exception:
+        return None
+
+
+def _profile_load_locked() -> None:
+    if _PROFILE_STATE["loaded"]:
+        return
+    _PROFILE_STATE["loaded"] = True
+    p = _profile_path()
+    if p is None or not p.exists():
+        return
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, dict):
+            raise ValueError("unexpected shape")
+        now = time.time()
+        for k, v in entries.items():
+            if isinstance(v, dict) and now - float(v.get("ts", 0)) <= _PROFILE_TTL:
+                _PROFILE_MEM[k] = {kk: float(vv) for kk, vv in v.items() if isinstance(vv, (int, float))}
+    except (ValueError, TypeError, OSError) as exc:
+        log.warning("hardware profile unreadable (%s): discarded", exc)
+        try:
+            os.replace(str(p), str(p.with_suffix(".corrupt.json")))
+        except OSError:
+            pass
+
+
+def profile_get(key: str) -> Optional[Dict[str, float]]:
+    with _PROFILE_LOCK:
+        _profile_load_locked()
+        v = _PROFILE_MEM.get(key)
+        if v and time.time() - v.get("ts", 0) <= _PROFILE_TTL:
+            return dict(v)
+    return None
+
+
+def profile_update(key: str, tps: Optional[float] = None, prefill_tps: Optional[float] = None,
+                   persist: bool = True, overhead: Optional[float] = None,
+                   pessimistic: bool = False) -> None:
+    """Merge a measurement into the per-(server, model) profile.
+
+    ``pessimistic=True`` keeps the SLOWEST prefill seen instead of averaging it.
+    A prompt served from the server KV cache reports a full prompt_n with a
+    near-zero TTFT: averaging that would teach a prefill speed 100x too high and
+    make the watchdog abort requests that are still alive.
+    """
+    with _PROFILE_LOCK:
+        _profile_load_locked()
+        v = _PROFILE_MEM.setdefault(key, {})
+        for name, val, cap in (("tps", tps, 5000.0), ("prefill_tps", prefill_tps, 5000.0),
+                               ("msg_overhead", overhead, 64.0)):
+            if val and val > 0:
+                val = min(float(val), cap)
+                if name not in v:
+                    v[name] = val
+                elif name == "prefill_tps" and pessimistic:
+                    v[name] = min(v[name], val)
+                else:
+                    v[name] = 0.7 * v[name] + 0.3 * val
+        v["ts"] = time.time()
+        p = _profile_path()
+        if not persist or p is None:
+            return
+        if time.time() - v.get("_saved", 0) < 60:
+            return
+        v["_saved"] = time.time()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(p.name + ".tmp.%d.%d" % (os.getpid(), threading.get_ident()))
+            payload = {"version": 2, "entries": {k: {a: b for a, b in e.items() if not a.startswith("_")}
+                                                 for k, e in _PROFILE_MEM.items()}}
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(str(tmp), str(p))
+        except Exception as exc:
+            log.debug("cannot save hardware profile: %s", exc)
+# ----------------------------------------------------------------------------
+# Context size discovery and budgets
+# ----------------------------------------------------------------------------
+_MODEL_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_MODEL_LOCK = threading.Lock()
+_MODEL_TTL = 60.0
+_MODEL_RETRY = 5.0
+
+
+class _Unreachable(Exception):
+    pass
+
+
+def _find_n_ctx(obj: Any, depth: int = 0) -> int:
+    if depth > 4:
+        return 0
+    if isinstance(obj, dict):
+        v = obj.get("n_ctx")
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+        for val in obj.values():
+            r = _find_n_ctx(val, depth + 1)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for val in obj[:4]:
+            r = _find_n_ctx(val, depth + 1)
+            if r:
+                return r
+    return 0
+
+
+def _probe_server(base_url: str, timeout: float) -> Tuple[int, str, bool]:
+    root = _root_url(base_url)
+    deadline = time.monotonic() + max(0.5, timeout)
+
+    def get(path: str) -> Any:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        try:
+            return _http_json(root + path, timeout=max(0.2, left))
+        except urllib.error.HTTPError:
+            return None
+        except ValueError:
+            return None
+        except Exception as exc:
+            raise _Unreachable(str(exc)) from exc
+
+    def value_of(j: Any) -> int:
+        v = j.get("value") if isinstance(j, dict) else j
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+    n_ctx, model = 0, ""
+    try:
+        j = get("/props")
+        if isinstance(j, dict):
+            n_ctx = _find_n_ctx(j)
+            model = str(j.get("model_alias") or os.path.basename(str(j.get("model_path") or "")))
+        for path in ("/api/extra/true_max_context_length", "/api/v1/config/max_context_length"):
+            if n_ctx:
+                break
+            n_ctx = value_of(get(path))
+        if not model:
+            j = get("/v1/models")
+            if isinstance(j, dict) and isinstance(j.get("data"), list) and j["data"] and isinstance(j["data"][0], dict):
+                model = str(j["data"][0].get("id") or "")
+        # Ollama exposes neither /props nor the Kobold endpoints. /api/ps reports
+        # the context ACTUALLY allocated to the loaded model. /api/show is NOT
+        # used on purpose: it reports the model maximum (e.g. 32768) while the
+        # server allocates 4k by default under 24 GiB, so trusting it would
+        # over-budget. If the model is not loaded yet we keep the cautious
+        # fallback; the next probe learns the real value once it is.
+        if not n_ctx and model:
+            j = get("/api/ps")
+            models = j.get("models") if isinstance(j, dict) else None
+            if isinstance(models, list):
+                for m in models:
+                    if not isinstance(m, dict):
+                        continue
+                    if str(m.get("name") or m.get("model") or "") != model:
+                        continue
+                    v = m.get("context_length")
+                    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                        n_ctx = v
+                    break
+    except _Unreachable as exc:
+        log.debug("server not reachable for n_ctx probe: %s", exc)
+        return n_ctx, model, False
+    return n_ctx, model, True
+def _classify(n_ctx: int) -> str:
+    return "small-8k" if n_ctx <= 8192 else "medium-32k" if n_ctx <= 32768 else "large-128k"
+
+
+def get_model_info(base_url: str = DEFAULT_BASE_URL, *, n_ctx: Optional[int] = None,
+                   refresh: bool = False, timeout: float = 2.0) -> Dict[str, Any]:
+    base = _check_base_url(base_url)
+    if n_ctx:
+        return {"n_ctx": int(n_ctx), "model": "unknown", "type": _classify(int(n_ctx)),
+                "base_url": base, "detected": True, "source": "user"}
+    now = time.monotonic()
+    with _MODEL_LOCK:
+        hit = _MODEL_CACHE.get(base)
+        if hit and not refresh and now < hit[0]:
+            return dict(hit[1])
+    found, model, reachable = _probe_server(base, timeout)
+    if not found and hit and hit[1]["detected"]:
+        info = dict(hit[1])                       # transient failure: keep what we knew
+    else:
+        size = found or FALLBACK_N_CTX
+        info = {"n_ctx": size, "model": model or "unknown", "type": _classify(size),
+                "base_url": base, "detected": bool(found), "source": "server" if found else "fallback"}
+    with _MODEL_LOCK:
+        _MODEL_CACHE[base] = (now + (_MODEL_TTL if reachable else _MODEL_RETRY), info)
+    return dict(info)
+
+
+def get_n_ctx(base_url: str = DEFAULT_BASE_URL) -> Tuple[int, str, str]:
+    info = get_model_info(base_url)
+    return info["n_ctx"], info["model"], info["type"]
+
+
+def plan_budget(n_ctx: int, prompt_tokens: int, *, max_tokens: Optional[int] = None,
+                tps: Optional[float] = None, target_seconds: Optional[float] = None,
+                margin: float = CTX_MARGIN) -> Dict[str, Any]:
+    """Output budget for ONE generation turn.
+
+    The budget is the free space in the context window (capped by ``max_tokens`` or
+    ABS_MAX_TURN_TOKENS). Speed only matters when you ask for ``target_seconds``.
+    """
+    usable = int(n_ctx * margin)
+    free = usable - int(prompt_tokens)
+    out = int(max_tokens) if max_tokens else min(max(free, 0), ABS_MAX_TURN_TOKENS)
+    if not max_tokens and target_seconds and tps and tps > 0:
+        out = min(out, max(256, int(tps * target_seconds)))
+    out = max(0, min(out, free))
+    return {"usable": usable, "free": free, "max_out": out, "fits": free >= MIN_OUT_TOKENS}
+
+
+def calcola_timeout_adattivo(prompt_tokens: int = 0, max_tokens: int = 512, temp: Optional[float] = None,
+                             tps_reale: Optional[float] = None, prefill_tps: Optional[float] = None,
+                             minimo: float = 300.0, massimo: float = 6 * 3600.0,
+                             modalita_tartaruga: bool = False) -> float:
+    """Generous upper bound for one request (3x the expected time, floor ``minimo``)."""
+    if modalita_tartaruga or os.environ.get("BOCCONCINI_NO_TIMEOUT") == "1":
+        return 86400.0
+    gen = tps_reale if tps_reale and tps_reale > 0 else 2.0
+    pre = prefill_tps / 3.0 if prefill_tps and prefill_tps > 0 else max(gen * 5.0, 10.0)
+    heat = 2.0 if temp is not None and temp >= 45 else 1.5 if temp is not None and temp >= 42 else 1.0
+    total = 30.0 + 3.0 * heat * (max(0, prompt_tokens) / pre + max(1, max_tokens) / gen)
+    return float(min(massimo, max(minimo, total)))
+
+
+def calcola_spazio_rimasto(prompt_base: str, base_url: str = DEFAULT_BASE_URL, margine_sicurezza: float = 0.85,
+                           token_counter: Optional[Any] = None, kind: str = "text", *,
+                           n_ctx: Optional[int] = None, riserva_risposta: int = 400,
+                           tps: Optional[float] = None) -> Dict[str, Any]:
+    """Tokens per chunk that fit next to ``prompt_base`` in the model context."""
+    info = get_model_info(base_url, n_ctx=n_ctx)
+    n = info["n_ctx"]
+    base_tok = _count(prompt_base, kind, token_counter)
+    raw = int(n * margine_sicurezza) - base_tok - riserva_risposta
+    ok = raw >= 200
+    if not ok:
+        log.warning("prompt_base (%d tokens) leaves almost no room in n_ctx=%d", base_tok, n)
+    cap = max(300, min(6000, n // 8))
+    space = min(max(200, raw), cap)
+    return {"spazio_per_pezzo": space, "n_ctx": n, "type": info["type"], "model": info["model"],
+            "prompt_base_tokens": base_tok, "base_url": info["base_url"], "detected": info["detected"],
+            "da_fallback": not info["detected"], "ok": ok, "prompt_budget": space,
+            "budget_vincolante": "spazio_n_ctx",
+            "consiglio": "%s context (%d): %d tokens per chunk" % (info["type"], n, space)}
+
+
+# ----------------------------------------------------------------------------
+# Exact token counting (optional, never used inside loops)
+# ----------------------------------------------------------------------------
+class LlamaServerTokenizer:
+    """Exact counts from llama.cpp /tokenize or KoboldCpp /api/extra/tokencount."""
+    _is_remote = True
+    _BACKENDS = (("/tokenize", "content", "tokens"), ("/api/extra/tokencount", "prompt", "value"))
+
+    def __init__(self, base_url: str = DEFAULT_BASE_URL, timeout: float = 1.5,
+                 retry_after: float = 30.0, cache_size: int = 256) -> None:
+        self._base = _root_url(base_url)
+        self._timeout, self._retry_after, self._cache_size = timeout, retry_after, cache_size
+        self._cache: "OrderedDict[str, int]" = OrderedDict()
+        self._backend: Optional[int] = None
+        self._down_until = 0.0
+        self._lock = threading.Lock()
+
+    def count_exact(self, text: str) -> int:
+        if not text:
+            return 0
+        key = hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).hexdigest()
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            if time.monotonic() < self._down_until:
+                return estimate_tokens(text, detect_kind(text))
+        count: Optional[int] = None
+        for i in ([self._backend] if self._backend is not None else range(len(self._BACKENDS))):
+            path, fname, rkey = self._BACKENDS[i]
+            try:
+                reply = _http_json(self._base + path, {fname: text}, timeout=self._timeout)
+            except urllib.error.HTTPError:
+                continue
+            except Exception as exc:
+                log.debug("tokenizer unreachable: %s", exc)
+                break
+            v = reply.get(rkey) if isinstance(reply, dict) else None
+            if isinstance(v, list):
+                count = len(v)

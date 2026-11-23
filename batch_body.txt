@@ -1,0 +1,5 @@
+            return R(calls=[{"id": "c%d" % i, "function": {
+                "name": "leggi_nodo", "arguments": json.dumps({"id": "b%d" % i})}}
+                for i in range(4)])
+        self.msgs = kw.get("messages")
+        return R("fatto")

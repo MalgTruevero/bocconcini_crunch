@@ -1,0 +1,4 @@
+        m = r["meta"]
+        print("  stop=%r evicted=%s deferred=%s searches=%s unknown=%s repeats=%s"
+              % (m.get("stopped"), m.get("evicted"), m.get("deferred", 0),
+                 m.get("searches", []), m.get("unknown_ids", []), m.get("repeats", 0)), flush=True)

@@ -1,0 +1,13 @@
+LICENSE
+README.md
+bocconcini_tree.py
+pyproject.toml
+bocconcini/__init__.py
+bocconcini/client.py
+bocconcini/docs.py
+bocconcini/memory.py
+bocconcini/rami.py
+bocconcini.egg-info/PKG-INFO
+bocconcini.egg-info/SOURCES.txt
+bocconcini.egg-info/dependency_links.txt
+bocconcini.egg-info/top_level.txt

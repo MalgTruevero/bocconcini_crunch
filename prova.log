@@ -1,0 +1,6 @@
+nohup: ignoring input
+PROVENIENZA: {"server": {"result": "KoboldCpp", "version": "1.124.2", "protected": false, "llm": true, "txt2img": false, "vision": false, "audio": false, "transcribe": false, "multiplayer": false, "websearch": false, "tts": false, "embeddings": true, "music": false, "musicllm": false, "musicfamily": "none", "savedata": false, "admin": 0, "router": false, "guidance": false, "jinja": true, "mcp": false, "parallelrequests": 1, "defaults_modified": false}, "models": {"object": "list", "data": [{"id": "koboldcpp/smol-tools-4b-16k-q4_k_m", "object": "model", "created": 1795170180, "owned_by": "koboldcpp", "status": {"value": "loaded"}, "permission": [], "root": "koboldcpp"}]}, "device": "Android-13-aarch64-64bit-ELF", "machine": "aarch64", "python": "3.14.10", "n_ctx": 4096, "cognitive_limit": null, "model_info": {"n_ctx": 4096, "model": "smol-tools-4b-16k-q4_k_m", "type": "small-8k", "base_url": "http://127.0.0.1:8082", "detected": true, "source": "server"}}
+documento: 131383 caratteri, ~41058 token, 10.02x n_ctx(4096)
+trovati 0/6 in 1226.4s, hops=6
+risposta: 
+report: prova_6aghi_40k.json

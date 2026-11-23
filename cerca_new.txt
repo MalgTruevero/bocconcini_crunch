@@ -1,0 +1,26 @@
+def _cerca(tree: "DocTree", session: str, query: str, limit: int = 8) -> Tuple[str, List[str]]:
+    """Search ids, labels, summaries AND the verbatim text of every branch.
+    Ids/labels alone made the tool useless: a word present in the document was
+    reported as absent. Python reads the disk, the model only receives ids."""
+    q = (query or "").strip().lower()
+    if not q:
+        return "[empty query]", []
+    keys = tree.keys(session)
+    order = sorted(keys)
+    hits = [k for k in order if q in k.lower()
+            or q in str(keys[k].get("label", "")).lower()
+            or q in str(keys[k].get("summary", "")).lower()][:limit]
+    for k in order:
+        if len(hits) >= limit:
+            break
+        if k in hits:
+            continue
+        try:
+            if q in tree.load(session, k).lower():
+                hits.append(k)
+        except TreeError:
+            continue
+    if not hits:
+        return "[no branch matches %r. Try another word.]" % query, []
+    return ("Matching branches (call leggi_nodo with the full id):\n"
+            + "\n".join("- " + k for k in hits)), hits

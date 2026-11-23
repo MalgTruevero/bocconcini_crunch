@@ -1,0 +1,500 @@
+            elif isinstance(v, int) and not isinstance(v, bool):
+                count = v
+            if count is not None:
+                with self._lock:
+                    self._backend = i
+                break
+        if count is None:
+            with self._lock:
+                self._down_until = time.monotonic() + self._retry_after
+            return estimate_tokens(text, detect_kind(text))
+        with self._lock:
+            self._cache[key] = count
+            while len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
+        return count
+
+    def __call__(self, text: str) -> int:
+        return self.count_exact(text)
+
+
+TokenCounter = LlamaServerTokenizer   # name used by 3.24
+
+
+# ----------------------------------------------------------------------------
+# One job at a time per server (re-entrant) + busy notifications
+# ----------------------------------------------------------------------------
+_GATES: Dict[str, "threading.RLock"] = {}
+_GATE_DEPTH: Dict[str, int] = {}
+_GATE_MUTEX = threading.Lock()
+_BUSY_SINCE: Dict[str, float] = {}
+_BUSY_LISTENERS: List[Callable[[Dict[str, Any]], None]] = []
+
+
+def _lock_key(base_url: str) -> str:
+    return _root_url(base_url).lower() if base_url else _root_url(DEFAULT_BASE_URL).lower()
+
+
+def _notify_busy(event: str, key: str) -> None:
+    with _GATE_MUTEX:
+        listeners = list(_BUSY_LISTENERS)
+    payload = {"event": event, "server": key, "busy": event == "busy_start", "at": time.time()}
+    for cb in listeners:
+        try:
+            cb(payload)
+        except Exception as exc:
+            log.debug("busy listener failed: %s", exc)
+
+
+def subscribe_busy(callback: Callable[[Dict[str, Any]], None]) -> Callable[[], None]:
+    with _GATE_MUTEX:
+        _BUSY_LISTENERS.append(callback)
+
+    def unsubscribe() -> None:
+        with _GATE_MUTEX:
+            if callback in _BUSY_LISTENERS:
+                _BUSY_LISTENERS.remove(callback)
+    return unsubscribe
+
+
+def busy_state(base_url: Optional[str] = None) -> Dict[str, Any]:
+    with _GATE_MUTEX:
+        if base_url is not None:
+            key = _lock_key(base_url)
+            since = _BUSY_SINCE.get(key)
+        elif _BUSY_SINCE:
+            key, since = min(_BUSY_SINCE.items(), key=lambda kv: kv[1])
+        else:
+            key, since = "", None
+    if since is None:
+        return {"busy": False, "server": key, "elapsed": 0.0, "since": 0.0}
+    return {"busy": True, "server": key, "elapsed": round(time.time() - since, 1), "since": since}
+
+
+def libreria_occupata(base_url: Optional[str] = None) -> bool:
+    with _GATE_MUTEX:
+        if base_url is not None:
+            return _GATE_DEPTH.get(_lock_key(base_url), 0) > 0
+        return any(v > 0 for v in _GATE_DEPTH.values())
+
+
+@contextmanager
+def lavoro_atomico(base_url: str = "", blocca_altri: bool = True, timeout_attesa: Optional[float] = None):
+    """Serialise work on one server (a phone serves one request at a time). Re-entrant."""
+    if not blocca_altri:
+        yield
+        return
+    key = _lock_key(base_url)
+    with _GATE_MUTEX:
+        lk = _GATES.setdefault(key, threading.RLock())
+    if not lk.acquire(timeout=-1 if timeout_attesa is None else float(timeout_attesa)):
+        raise ModelError("another job is still running on %s" % key, kind="busy")
+    with _GATE_MUTEX:
+        _GATE_DEPTH[key] = _GATE_DEPTH.get(key, 0) + 1
+        first = _GATE_DEPTH[key] == 1
+        if first:
+            _BUSY_SINCE[key] = time.time()
+    if first:
+        _notify_busy("busy_start", key)
+    try:
+        yield
+    finally:
+        with _GATE_MUTEX:
+            _GATE_DEPTH[key] -= 1
+            last = _GATE_DEPTH[key] == 0
+            if last:
+                _BUSY_SINCE.pop(key, None)
+        if last:
+            _notify_busy("busy_end", key)
+        lk.release()
+
+
+def recupera_continuazione_dopo_crash() -> None:
+    """Removed in 4.0 (the temp file was never needed). Use on_partial / ModelError.reply."""
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Tool calls found in text (only for tools the caller declared)
+# ----------------------------------------------------------------------------
+_TOOL_TAG = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S | re.I)
+_FENCE = re.compile(r"^```(?:json|tool_call|tool)?\s*(.*?)\s*```$", re.S | re.I)
+
+
+def _as_call(obj: Any, names: Iterable[str]) -> Optional[Dict[str, Any]]:
+    if not isinstance(obj, dict):
+        return None
+    fn = obj.get("function") if isinstance(obj.get("function"), dict) else obj
+    name = fn.get("name") or fn.get("tool") or fn.get("tool_name") or obj.get("tool") or obj.get("name")
+    if not isinstance(name, str) or name not in names:
+        return None
+    args: Any = {}
+    for k in ("arguments", "parameters", "args", "input"):
+        if k in fn:
+            args = fn[k]
+            break
+        if k in obj:
+            args = obj[k]
+            break
+    if isinstance(args, str):
+        try:
+            json.loads(args)
+        except ValueError:
+            return None
+        arg_s = args
+    elif isinstance(args, dict):
+        arg_s = json.dumps(args, ensure_ascii=False)
+    else:
+        return None
+    return {"id": "", "type": "function", "function": {"name": name, "arguments": arg_s}}
+
+
+def _calls_from_json(candidate: str, names: Iterable[str]) -> List[Dict[str, Any]]:
+    try:
+        obj = json.loads(candidate)
+    except ValueError:
+        return []
+    items = obj if isinstance(obj, list) else [obj]
+    return [c for c in (_as_call(i, names) for i in items) if c]
+
+
+def parse_tool_calls_from_text(text: str, tool_names: Iterable[str]) -> Tuple[List[Dict[str, Any]], str]:
+    """Find tool calls a model wrote as text. Returns (calls, remaining_text).
+
+    Deliberately conservative: only names of tools you declared are accepted, and bare JSON
+    counts only when the WHOLE reply is that JSON (a JSON example inside prose is never executed).
+    """
+    names = set(tool_names or ())
+    if not text or not names:
+        return [], text
+    calls: List[Dict[str, Any]] = []
+    for m in _TOOL_TAG.finditer(text):
+        calls.extend(_calls_from_json(m.group(1), names))
+    if calls:
+        rest = _TOOL_TAG.sub("", text).strip()
+    else:
+        body = text.strip()
+        mf = _FENCE.match(body)
+        calls = _calls_from_json(mf.group(1) if mf else body, names) if (mf or body[:1] in "{[") else []
+        rest = "" if calls else text
+    for i, c in enumerate(calls):
+        c["id"] = "call_text_%d" % i
+    return calls, rest
+
+
+def _json_in_text(text: str) -> Tuple[bool, Any]:
+    s = (text or "").strip()
+    if not s or not ((s[0] == "{" and s[-1] == "}") or (s[0] == "[" and s[-1] == "]")):
+        return False, None
+    try:
+        return True, json.loads(s)
+    except ValueError:
+        return False, None
+
+
+# ----------------------------------------------------------------------------
+# Replies, stream parsing
+# ----------------------------------------------------------------------------
+@dataclass
+class ChatReply:
+    text: str = ""
+    reasoning: str = ""
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    finish_reason: str = ""
+    ttft: float = 0.0
+    tps: float = 0.0
+    tokens: int = 0
+    spill_path: Optional[str] = None       # kept for 3.x compatibility, always None
+    json_nel_testo: Optional[Any] = None   # the text is a valid JSON document -> parsed value
+    ha_json_nel_testo: bool = False
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+def _merge_tool_delta(acc: Dict[int, Dict[str, Any]], delta: Dict[str, Any]) -> None:
+    fn = delta.get("function") if isinstance(delta.get("function"), dict) else {}
+    name = fn.get("name") if isinstance(fn.get("name"), str) else delta.get("name")
+    args = fn.get("arguments", delta.get("arguments"))
+    idx = delta.get("index")
+    if not isinstance(idx, int):
+        idx = len(acc) if (name or not acc) else max(acc)
+    cur = acc.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+    if isinstance(delta.get("id"), str) and delta["id"] and not cur["id"]:
+        cur["id"] = delta["id"]
+    if isinstance(delta.get("type"), str) and delta["type"]:
+        cur["type"] = delta["type"]
+    if isinstance(name, str) and name and not cur["function"]["name"]:
+        cur["function"]["name"] = name
+    if isinstance(args, dict):
+        cur["function"]["arguments"] += json.dumps(args, ensure_ascii=False)
+    elif isinstance(args, str):
+        cur["function"]["arguments"] += args
+
+
+def _finalize_tool_calls(acc: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for n, idx in enumerate(sorted(acc)):
+        call = acc[idx]
+        call["id"] = call["id"] or "call_%d" % n
+        call["function"]["arguments"] = call["function"]["arguments"] or "{}"
+        out.append(call)
+    return out
+
+
+def _extract_parts(obj: Any) -> Dict[str, Any]:
+    """Normalise one JSON object from OpenAI/llama.cpp/Kobold/Ollama, streamed or not.
+
+    Token counts from every dialect are normalised into ``timings`` using the
+    llama.cpp vocabulary (``prompt_n`` / ``predicted_n``): one place to read the
+    truth from, whatever the server. This is what makes self-calibration possible.
+    """
+    p: Dict[str, Any] = {"content": "", "think": "", "calls": [], "finish": "", "done": False,
+                         "tokens": None, "timings": None}
+    if not isinstance(obj, dict):
+        return p
+    tim = dict(obj["timings"]) if isinstance(obj.get("timings"), dict) else {}
+    u = obj.get("usage")
+    if isinstance(u, dict):
+        ct = u.get("completion_tokens")
+        if isinstance(ct, int) and not isinstance(ct, bool):
+            p["tokens"] = ct
+            tim.setdefault("predicted_n", ct)
+        pt = u.get("prompt_tokens")
+        if isinstance(pt, int) and not isinstance(pt, bool):
+            tim.setdefault("prompt_n", pt)
+    for k, dst in (("tokens_predicted", "predicted_n"), ("tokens_evaluated", "prompt_n"),
+                   ("eval_count", "predicted_n"), ("prompt_eval_count", "prompt_n")):
+        v = obj.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            tim.setdefault(dst, v)
+    # prompt_total = every prompt token the server accounted for, cached ones included.
+    # llama.cpp's timings.prompt_n counts only the tokens it had to evaluate: comparing
+    # THAT with what we sent would flag every KV-cache hit as a truncated prompt.
+    total = None
+    if isinstance(u, dict) and isinstance(u.get("prompt_tokens"), int) and not isinstance(u.get("prompt_tokens"), bool):
+        total = u["prompt_tokens"]
+    elif isinstance(tim.get("prompt_n"), int) and isinstance(tim.get("cache_n"), int):
+        total = tim["prompt_n"] + tim["cache_n"]
+    if total and total > 0:
+        tim["prompt_total"] = total
+    pn = tim.get("predicted_n")
+    if p["tokens"] is None and isinstance(pn, int) and pn > 0:
+        p["tokens"] = pn
+    p["timings"] = tim or None
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        ch = choices[0]
+        d = ch.get("delta") if isinstance(ch.get("delta"), dict) else (
+            ch.get("message") if isinstance(ch.get("message"), dict) else {})
+        p["content"] = _as_text(d.get("content")) or (ch["text"] if isinstance(ch.get("text"), str) else "")
+        p["think"] = _as_text(d.get("reasoning_content") or d.get("reasoning"))
+        p["calls"] = d.get("tool_calls") if isinstance(d.get("tool_calls"), list) else []
+        p["finish"] = str(ch.get("finish_reason") or "")
+    elif isinstance(obj.get("message"), dict):                       # Ollama /api/chat
+        m = obj["message"]
+        p["content"], p["think"] = _as_text(m.get("content")), _as_text(m.get("thinking"))
+        p["calls"] = m.get("tool_calls") if isinstance(m.get("tool_calls"), list) else []
+        p["done"] = bool(obj.get("done"))
+        p["finish"] = str(obj.get("done_reason") or ("stop" if p["done"] else ""))
+        if isinstance(obj.get("eval_count"), int):
+            p["tokens"] = obj["eval_count"]
+    elif isinstance(obj.get("response"), str):
+        p["content"], p["done"] = obj["response"], bool(obj.get("done"))
+        p["finish"] = "stop" if p["done"] else ""
+    elif isinstance(obj.get("content"), str):                        # llama.cpp native
+        p["content"], p["done"] = obj["content"], bool(obj.get("stop"))
+        p["finish"] = "stop" if p["done"] else ""
+    return p
+class _Turn:
+    __slots__ = ("text", "think", "calls", "finish", "events", "first", "last", "tokens",
+                 "timings", "chars", "thinkchars", "completed")
+
+    def __init__(self) -> None:
+        self.text: List[str] = []
+        self.think: List[str] = []
+        self.calls: Dict[int, Dict[str, Any]] = {}
+        self.finish = ""
+        self.events = 0
+        self.first: Optional[float] = None
+        self.last: Optional[float] = None
+        self.tokens: Optional[int] = None
+        self.timings: Optional[Dict[str, Any]] = None
+        self.chars = 0
+        self.thinkchars = 0
+        self.completed = False
+
+
+class _HTTPFail(Exception):
+    def __init__(self, status: int, body: str) -> None:
+        super().__init__("HTTP %d" % status)
+        self.status, self.body = status, body
+
+
+# ----------------------------------------------------------------------------
+# Watchdog: total deadline + dead-server detection, aborts by closing the socket
+# ----------------------------------------------------------------------------
+def _close_conn(conn: Any, sock: Any = None) -> None:
+    """Shut the connection down. ``sock`` must be the raw socket saved at connect time:
+    http.client sets ``conn.sock = None`` as soon as a ``Connection: close`` response
+    starts, so ``conn.sock`` alone cannot interrupt a read that is already blocked."""
+    if conn is None and sock is None:
+        return
+    sock = sock if sock is not None else getattr(conn, "sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, ValueError):
+            pass
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+class _Guard:
+    """Aborts a request on total timeout or when the server stops answering.
+
+    A silent stream is NOT an error (prefill on a phone can take minutes): after
+    ``idle_limit`` seconds of silence the server is probed; only ``max_failures``
+    failed probes in a row abort.
+    """
+    def __init__(self, deadline: Optional[float], idle_limit: float, interval: float,
+                 probe: Optional[Callable[[], bool]], max_failures: int) -> None:
+        self.deadline, self.idle_limit, self.interval = deadline, idle_limit, interval
+        self.probe, self.max_failures = probe, max_failures
+        self.reason: Optional[str] = None
+        self.t0 = self.last = time.monotonic()
+        self._conn: Any = None
+        self.sock: Any = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def attach(self, conn: Any, sock: Any = None) -> None:
+        with self._lock:
+            self._conn = conn
+            if sock is not None:
+                self.sock = sock
+            dead = self.reason is not None
+        if dead:
+            _close_conn(conn, sock)
+
+    def touch(self) -> None:
+        self.last = time.monotonic()
+
+    def abort(self, reason: str) -> None:
+        with self._lock:
+            if self.reason:
+                return
+            self.reason = reason
+            conn, sock = self._conn, self.sock
+        log.warning("aborting request: %s", reason)
+        _close_conn(conn, sock)
+
+    def _loop(self) -> None:
+        fails = 0
+        while not self._stop.wait(self.interval):
+            now = time.monotonic()
+            if self.deadline and now - self.t0 > self.deadline:
+                self.abort("total timeout of %.0fs exceeded" % self.deadline)
+                return
+            if now - self.last < self.idle_limit or self.probe is None:
+                fails = 0
+                continue
+            try:
+                ok = bool(self.probe())
+            except Exception:
+                ok = False
+            if ok:
+                fails = 0
+                log.info("still waiting (%.0fs without data): server is alive", now - self.last)
+                continue
+            fails += 1
+            if fails >= self.max_failures:
+                self.abort("server no longer responding")
+                return
+
+    def start(self) -> None:
+        try:
+            threading.Thread(target=self._loop, daemon=True, name="bocconcini-watchdog").start()
+        except (RuntimeError, OSError) as exc:
+            log.debug("cannot start watchdog: %s", exc)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+# ----------------------------------------------------------------------------
+# Text helpers for continuation and reduction
+# ----------------------------------------------------------------------------
+def _trim_tail(text: str, max_trim: int = 240) -> str:
+    """Drop only the incomplete tail (<= max_trim chars): back to the last line/sentence/word end."""
+    if len(text) < 80:
+        return text
+    z0 = max(0, len(text) - max_trim)
+    zone = text[z0:]
+    cut = -1
+    i = zone.rfind("\n")
+    if i != -1:
+        cut = z0 + i + 1
+    else:
+        j = max(zone.rfind(". "), zone.rfind("! "), zone.rfind("? "))
+        if j != -1:
+            cut = z0 + j + 2
+        else:
+            k = zone.rfind(" ")
+            if k != -1:
+                cut = z0 + k + 1
+    return text[:cut] if cut > 0 else text
+
+
+def _stitch(prev: str, new: str, window: int = 400) -> str:
+    """Remove from ``new`` any beginning that repeats the end of ``prev``."""
+    if not new:
+        return ""
+    tail = prev[-window:]
+    for k in range(min(len(tail), len(new)), 7, -1):
+        if tail.endswith(new[:k]):
+            return new[k:]
+    return new
+
+
+class _Holdback:
+    """Delays the live stream of a continuation turn until it can be de-duplicated."""
+    def __init__(self, emit: Callable[[str], None], ref: str, hold: int = 200) -> None:
+        self.emit, self.ref, self.hold = emit, ref, hold
+        self.buf, self.done = "", False
+
+    def __call__(self, delta: str) -> None:
+        if self.done:
+            self.emit(delta)
+            return
+        self.buf += delta
+        if len(self.buf) >= self.hold:
+            self.close()
+
+    def close(self) -> None:
+        if self.done:
+            return
+        self.done = True
+        out = _stitch(self.ref, self.buf)
+        if out:
+            self.emit(out)
+
+
+def _words(question: str) -> List[str]:
+    return list(dict.fromkeys(re.findall(r"\w{4,}", (question or "").lower())))[:24]
+
+
+def extract_local(text: str, question: str, max_tokens: int) -> str:
+    """Model-free extraction: keep the sentences/lines that mention the question's words."""
+    budget = int(max(20, max_tokens) * 3.2)

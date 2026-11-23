@@ -1,0 +1,500 @@
+        if conn.sock is not None:
+            conn.sock.settimeout(None)    # NO read timeout: it would break the buffered reader. Watchdog aborts.
+        path = (p.path or "/") + ("?" + p.query if p.query else "")
+        conn.request("POST", path, body=body, headers=self._headers())
+        return conn, conn.getresponse()
+
+    def _feed(self, turn: _Turn, p: Dict[str, Any], on_partial: Optional[Callable[[str], None]]) -> None:
+        if p["tokens"] is not None:
+            turn.tokens = p["tokens"]
+        if p["timings"]:
+            turn.timings = p["timings"]
+        if not (p["content"] or p["think"] or p["calls"]):
+            return
+        now = time.monotonic()
+        turn.events += 1
+        turn.last = now
+        if turn.first is None:
+            turn.first = now
+        if p["content"]:
+            turn.text.append(p["content"])
+            turn.chars += len(p["content"])
+            if on_partial:
+                try:
+                    on_partial(p["content"])
+                except Exception as exc:
+                    log.debug("on_partial failed: %s", exc)
+        if p["think"] and turn.thinkchars < MAX_REASONING_CHARS:
+            turn.think.append(p["think"])
+            turn.thinkchars += len(p["think"])
+        for d in p["calls"]:
+            if isinstance(d, dict):
+                _merge_tool_delta(turn.calls, d)
+
+    def _read(self, conn: Any, resp: Any, turn: _Turn, guard: _Guard, c: _Call,
+              on_partial: Optional[Callable[[str], None]]) -> None:
+        ctype = (resp.getheader("Content-Type") or "").split(";")[0].strip().lower()
+        if c.stream and ctype in _STREAM_TYPES:
+            try:
+                for raw in resp:
+                    guard.touch()
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if line == "[DONE]":
+                        turn.completed = True
+                        break
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("error"):
+                        raise ModelError("server reported an error: %s" % json.dumps(obj["error"])[:300], kind="server")
+                    p = _extract_parts(obj)
+                    self._feed(turn, p, on_partial)
+                    if p["finish"]:
+                        turn.finish, turn.completed = p["finish"], True
+                        if guard.sock is not None:                # a closing usage chunk may follow; don't hang on it
+                            guard.sock.settimeout(5.0)
+                    if turn.chars > self.max_output_chars:
+                        turn.finish, turn.completed = "length", True
+                        break
+            except socket.timeout:
+                if not turn.completed:
+                    raise
+            return
+        raw = resp.read()
+        guard.touch()
+        obj = json.loads(raw.decode("utf-8", "replace"))
+        if isinstance(obj, dict) and obj.get("error"):
+            raise ModelError("server reported an error: %s" % json.dumps(obj["error"])[:300], kind="server")
+        p = _extract_parts(obj)
+        if not (p["content"] or p["think"] or p["calls"] or p["finish"]):
+            raise ModelError("unrecognised response: " + raw[:200].decode("utf-8", "replace"), kind="protocol")
+        self._feed(turn, p, on_partial)
+        turn.finish = p["finish"] or "stop"
+        turn.completed = True
+        turn.first = turn.first or time.monotonic()
+        turn.last = turn.last or turn.first
+
+    def _reply_from_turn(self, turn: _Turn, strip: bool, t0: float) -> ChatReply:
+        raw = "".join(turn.text)
+        if strip:
+            answer, rtag, trunc = split_thinking(raw)
+        else:
+            answer, rtag, trunc = raw.strip(), "", False
+        reasoning = "".join(turn.think)
+        if rtag:
+            reasoning = (reasoning + "\n" + rtag).strip()
+        tim = turn.timings or {}
+        tps = 0.0
+        if isinstance(tim.get("predicted_per_second"), (int, float)) and tim["predicted_per_second"] > 0:
+            tps = float(tim["predicted_per_second"])
+        elif turn.events >= 6 and turn.first is not None and turn.last is not None and turn.last - turn.first > 0.2:
+            tps = (turn.events - 1) / (turn.last - turn.first)
+        pred_n = tim.get("predicted_n")
+        tokens = turn.tokens
+        if tokens is None:                      # non-streaming: events would be 1
+            tokens = int(pred_n) if isinstance(pred_n, int) and pred_n > 0 else turn.events
+        ttft = (turn.first - t0) if turn.first is not None else time.monotonic() - t0
+        r = ChatReply(answer, reasoning, _finalize_tool_calls(turn.calls), turn.finish or "stop",
+                      ttft, tps, int(tokens))
+        r.meta["thinking_truncated"] = trunc
+        r.meta["raw_start"] = raw[:200]
+        prompt_n = tim.get("prompt_n")
+        prompt_total = tim.get("prompt_total") or prompt_n
+        if isinstance(prompt_total, int) and prompt_total > 0:
+            r.meta["prompt_tokens_real"] = prompt_total
+        if isinstance(tim.get("cache_n"), int):
+            r.meta["cache_n"] = tim["cache_n"]
+        if self.flavor != "openai":
+            pf = None
+            if (isinstance(tim.get("prompt_per_second"), (int, float)) and (tim.get("prompt_n") or 0) >= 64
+                    and (tim.get("prompt_ms") or 0) >= 200):
+                pf = float(tim["prompt_per_second"])
+            if tps > 0 or pf:
+                profile_update(self._hw_key(), tps=tps or None, prefill_tps=pf, persist=self.persist_profile)
+            # No timings from this server (Kobold, Ollama): derive prefill from TTFT.
+            # Pessimistic merge, because a KV-cache hit gives prompt_n with ttft ~ 0.
+            if pf is None and isinstance(prompt_n, int) and prompt_n >= 64 and ttft >= 0.5:
+                obs = prompt_n / ttft
+                r.meta["prefill_observed"] = round(obs, 2)
+                # A KV-cache hit reports the full prompt_n with a near-zero TTFT.
+                # The pessimistic merge handles it only if we already know a value,
+                # so also cap it: prefill cannot be 25x faster than generation on
+                # the same hardware. Rejecting a good sample is harmless (we fall
+                # back to the cautious default); accepting a cache hit would make
+                # the watchdog abort requests that are still alive.
+                gen_ref = tps or self._hw().get("tps") or 2.0
+                if 0.05 <= obs <= max(30.0, gen_ref * 25.0):
+                    profile_update(self._hw_key(), prefill_tps=obs, persist=self.persist_profile,
+                                   pessimistic=True)
+        return r
+    def _exchange(self, url: str, data: Dict[str, Any], c: _Call, ptoks: int, max_out: int,
+                  on_partial: Optional[Callable[[str], None]]) -> ChatReply:
+        body = json.dumps(self._adapt(url, data), ensure_ascii=False).encode("utf-8")
+        # Silence during prefill is not death: a phone at 5 T/s needs ~400 s for a 2000-token prompt.
+        # Derive the patience from the measured prefill speed (only ever raised; an explicitly
+        # configured idle_limit is always respected).
+        idle = self.idle_limit
+        if idle == type(self).idle_limit:
+            rate = self._hw().get("prefill_tps") or 0
+            if rate > 0:
+                idle = max(idle, min(900.0, 1.5 * ptoks / rate))
+        guard = _Guard(self._deadline(c, ptoks, max_out), idle, self.watchdog_interval,
+                       self._probe(), self.max_failures)
+        turn, conn = _Turn(), None
+        t0 = time.monotonic()
+        guard.start()
+        try:
+            conn, resp = self._open(url, body, guard)
+            guard.touch()
+            if resp.status >= 400:
+                raise _HTTPFail(resp.status, resp.read(2000).decode("utf-8", "replace"))
+            self._read(conn, resp, turn, guard, c, on_partial)
+        except _HTTPFail:
+            raise
+        except ModelError as exc:
+            if exc.reply is None and turn.events:
+                exc.reply = self._reply_from_turn(turn, c.strip, t0)
+            raise
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            partial = self._reply_from_turn(turn, c.strip, t0) if turn.events else None
+            if guard.reason:
+                raise ModelError("generation aborted: %s" % guard.reason, reply=partial, kind="aborted") from exc
+            if isinstance(exc, ValueError):
+                raise ModelError("invalid response from %s: %s" % (url, exc), reply=partial, kind="protocol") from exc
+            raise ModelError("connection lost at %s after %.0fs: %s" % (url, time.monotonic() - t0, exc),
+                             reply=partial, kind="connection") from exc
+        finally:
+            guard.stop()
+            _close_conn(conn, guard.sock)
+        if guard.reason and not turn.completed:
+            raise ModelError("generation aborted: %s" % guard.reason,
+                             reply=self._reply_from_turn(turn, c.strip, t0) if turn.events else None, kind="aborted")
+        if not turn.completed:
+            raise ModelError("the stream ended without a finish reason (server crashed?)",
+                             reply=self._reply_from_turn(turn, c.strip, t0) if turn.events else None,
+                             kind="stream_interrupted")
+        return self._reply_from_turn(turn, c.strip, t0)
+
+    def _harvest_n_ctx(self, body: str) -> Optional[int]:
+        """Learn the real context window from the server's own overflow message.
+
+        Last line of defence for a wrong detection: the server knows its size and
+        usually prints it. An explicit n_ctx passed by the caller still wins.
+        """
+        pat = r"(?:n_ctx|context size|context length|context window|max context)[^0-9]{0,24}(\d{3,7})"
+        best = 0
+        for m in re.finditer(pat, body or "", re.I):
+            v = int(m.group(1))
+            if 512 <= v <= 1048576:
+                best = v
+        if not best:
+            return None
+        base = _check_base_url(self.base_url)
+        with _MODEL_LOCK:
+            hit = _MODEL_CACHE.get(base)
+            info = dict(hit[1]) if hit else {}
+            if info.get("n_ctx") == best and info.get("detected"):
+                return None
+            info.setdefault("model", self._model_seen or "unknown")
+            info.update({"n_ctx": best, "type": _classify(best), "detected": True,
+                         "source": "server_error", "base_url": base})
+            _MODEL_CACHE[base] = (time.monotonic() + _MODEL_TTL, info)
+        log.warning("context window learned from the server error: %d tokens", best)
+        return best
+
+    def _turn_once(self, c: _Call, msgs: List[Dict[str, Any]], max_out: int, thinking: Optional[bool],
+                   tool_choice: Any, on_partial: Optional[Callable[[str], None]], ptoks: int,
+                   tools: Optional[List[Dict[str, Any]]]) -> ChatReply:
+        data = self._payload(c, msgs, max_out, thinking, tool_choice, tools)
+        for url in self._chat_urls():
+            dropped = False
+            while True:
+                try:
+                    reply = self._exchange(url, data, c, ptoks, max_out, on_partial)
+                except _HTTPFail as exc:
+                    if exc.status == 404:
+                        break                                       # next endpoint
+                    if exc.status in (400, 422) and not dropped and any(k in data for k in _OPTIONAL_FIELDS):
+                        for k in _OPTIONAL_FIELDS:                  # server dislikes an optional field
+                            data.pop(k, None)
+                        dropped = True
+                        log.warning("HTTP %d: retrying without optional fields", exc.status)
+                        continue
+                    low = exc.body.lower()
+                    kind = "context_overflow" if ("context" in low or "exceed" in low or "too long" in low) else "http"
+                    extra = ""
+                    if kind == "context_overflow":
+                        learned = self._harvest_n_ctx(exc.body)
+                        if learned:
+                            extra = " [context window learned: %d tokens; retry will use it]" % learned
+                    raise ModelError("server answered HTTP %d at %s: %s%s" % (exc.status, url, exc.body[:300], extra),
+                                     kind=kind) from exc
+                self._url_ok = url
+                try:
+                    self._check_truncation(ptoks, reply)
+                    if not reply.meta.get("prompt_truncated"):
+                        self._calibrate(msgs, reply, tools)
+                except Exception as exc:
+                    log.debug("calibration skipped: %s", exc)
+                return reply
+        raise ModelError("no chat endpoint found (HTTP 404 on: %s)" % ", ".join(self._chat_urls()), kind="http")
+
+    # -- generation logic ----------------------------------------------------
+    def _generate(self, c: _Call, msgs: List[Dict[str, Any]], n_ctx: int, tools_tokens: int,
+                  tool_choice: Any, meta: Dict[str, Any]) -> ChatReply:
+        ptoks = self._prompt_tokens(msgs, tools_tokens)
+        plan = self._plan(c, n_ctx, ptoks)
+        meta.update({"prompt_tokens": ptoks, "max_out": plan["max_out"]})
+        reply = self._turn_once(c, msgs, plan["max_out"], c.thinking, tool_choice, c.on_partial, ptoks, c.tools)
+        if reply.meta.get("prompt_truncated"):
+            meta["prompt_truncated"] = True
+            log.warning("the server cut the prompt: retries and continuation would only waste time")
+            return reply
+        # (a) the budget was eaten by reasoning: nothing to show -> retry once, thinking off, more room
+        if not reply.text and not reply.tool_calls and reply.finish_reason == "length":
+            out = min(plan["free"], max(plan["max_out"] * 2, 1024))
+            if out > plan["max_out"] or c.thinking is not False:
+                log.warning("reasoning used the whole budget (%d tokens): retrying with thinking off", plan["max_out"])
+                meta["thinking_retry"] = True
+                reply = self._turn_once(c, msgs, out, False, tool_choice, c.on_partial, ptoks, c.tools)
+        # (b) a tool call cut in the middle of its JSON arguments: retry with a bigger budget
+        elif reply.tool_calls and reply.finish_reason == "length" and not _args_valid(reply.tool_calls):
+            out = min(plan["free"], plan["max_out"] * 2)
+            if out > plan["max_out"]:
+                log.warning("tool call truncated: retrying with %d tokens", out)
+                meta["tool_retry"] = True
+                reply = self._turn_once(c, msgs, out, False, tool_choice, None, ptoks, c.tools)
+        # (c) text cut by the token limit: finish it with tail continuation
+        if c.continua and reply.finish_reason == "length" and reply.text and not reply.tool_calls:
+            reply = self._continue(c, msgs, reply, n_ctx, tools_tokens, meta)
+        return reply
+
+    def _continuation_base(self, c: _Call, msgs: List[Dict[str, Any]], first: ChatReply,
+                           n_ctx: int) -> Tuple[List[Dict[str, Any]], str]:
+        """Which messages a continuation turn re-sends in front of the assistant tail.
+
+        full  : the original messages (the server KV cache makes this cheap when it works).
+        light : system messages + the last user message cut to a quarter of the window. Older
+                history is dropped: on a slow device re-reading a long conversation for every
+                continuation turn costs minutes.
+        auto  : light only when the prompt is big AND neither a cache hit nor a fast prefill
+                makes re-sending it cheap.
+        """
+        mode = c.continuation_context
+        if mode == "full":
+            return msgs, "full"
+        if mode == "auto":
+            ptoks = self._prompt_tokens(msgs)
+            pf = self._hw().get("prefill_tps")
+            cheap = (ptoks <= 1500 or (first.meta.get("cache_n") or 0) > 0
+                     or (pf is not None and ptoks / pf <= 15.0))
+            if cheap:
+                return msgs, "full"
+        users = [m for m in msgs if m.get("role") == "user"]
+        if not users:
+            return msgs, "full"
+        cap = int(max(300, int(n_ctx * CTX_MARGIN * 0.25)) * 3.2)
+        text = _as_text(users[-1].get("content"))
+        if len(text) > cap:
+            text = text[: cap // 2] + "\n[...]\n" + text[-(cap // 2):]
+        return [m for m in msgs if m.get("role") == "system"] + [{"role": "user", "content": text}], "light"
+
+    def _continue(self, c: _Call, msgs: List[Dict[str, Any]], first: ChatReply, n_ctx: int,
+                  tools_tokens: int, meta: Dict[str, Any]) -> ChatReply:
+        """Finish a truncated answer. Only the incomplete tail is trimmed and regenerated."""
+        acc, tokens, turns, stall = first.text, first.tokens, 1, 0
+        cur, reasoning = first, first.reasoning
+        c2 = replace(c, tools=None, tool_choice=None)
+        usable = int(n_ctx * CTX_MARGIN)
+        base_msgs, mode = self._continuation_base(c, msgs, first, n_ctx)
+        meta["continuation_context"] = mode
+        while cur.finish_reason == "length" and turns < c.max_turns and tokens < c.max_total_tokens:
+            trimmed = _trim_tail(acc)
+            base = self._prompt_tokens(base_msgs)
+            room = usable - base
+            if room < 192:
+                meta["continuation_stopped"] = "context"
+                break
+            tail_tokens = max(96, min(512, int(room * 0.15)))
+            tail = trimmed[-int(tail_tokens * _cpt("text")):]
+            cont_msgs = list(base_msgs) + [{"role": "assistant", "content": tail},
+                                      {"role": "user", "content": self.continue_prompt}]
+            cptoks = self._prompt_tokens(cont_msgs)
+            plan = self._plan(c2, n_ctx, cptoks)
+            if not plan["fits"]:
+                meta["continuation_stopped"] = "context"
+                break
+            hb = _Holdback(c.on_partial, trimmed) if c.on_partial else None
+            try:
+                nxt = self._turn_once(c2, cont_msgs, plan["max_out"], False, None, hb, cptoks, None)
+            except ModelError as exc:
+                meta["continuation_error"] = str(exc)
+                log.warning("continuation turn failed: %s", exc)
+                break
+            finally:
+                if hb:
+                    hb.close()
+            if nxt.meta.get("prompt_truncated"):
+                meta["prompt_truncated"] = True
+                meta["continuation_truncated"] = meta.get("continuation_truncated", 0) + 1
+                log.warning("a continuation turn had its prompt cut: stopping")
+                break
+            new = nxt.text
+            if len(new) >= 60 and new[:60] in acc[:600]:
+                meta["continuation_stopped"] = "restart"        # the model started over: keep what we have
+                break
+            piece = _stitch(trimmed, new)
+            acc = trimmed + piece
+            tokens += nxt.tokens
+            reasoning = (reasoning + "\n" + nxt.reasoning).strip() if nxt.reasoning else reasoning
+            cur, turns = nxt, turns + 1
+            stall = stall + 1 if len(piece.strip()) < 8 else 0
+            if stall >= 2:
+                meta["continuation_stopped"] = "stalled"
+                break
+        meta["turns"] = turns
+        if cur.finish_reason == "length":
+            meta["truncated"] = True
+        out = ChatReply(acc, reasoning, first.tool_calls, cur.finish_reason, first.ttft, cur.tps or first.tps, tokens)
+        out.meta.update(first.meta)
+        if meta.get("prompt_truncated"):
+            out.meta["prompt_truncated"] = True
+        return out
+
+    def _ensure_action(self, c: _Call, msgs: List[Dict[str, Any]], reply: ChatReply, force_action: bool,
+                       validator: Optional[Callable[[ChatReply], bool]], retries: int, n_ctx: int,
+                       tools_tokens: int, meta: Dict[str, Any]) -> ChatReply:
+        names = [t.get("function", {}).get("name") for t in (c.tools or []) if isinstance(t, dict)]
+        names = [n for n in names if n]
+        if names and not reply.tool_calls:
+            calls, rest = parse_tool_calls_from_text(reply.text, names)
+            if not calls and not reply.text and reply.reasoning:        # acted inside the reasoning
+                calls, _ = parse_tool_calls_from_text(reply.reasoning, names) if _TOOL_TAG.search(reply.reasoning) else ([], "")
+                rest = ""
+            if calls:
+                reply.tool_calls, reply.text = calls, rest
+                meta["tool_calls_from_text"] = True
+        if not force_action or msgs[-1].get("role") == "tool":
+            return reply
+
+        def acted(r: ChatReply) -> bool:
+            if validator is not None:
+                try:
+                    return bool(validator(r))
+                except Exception:
+                    return False
+            return bool(r.tool_calls) if c.tools else True
+
+        for attempt in range(max(0, retries)):
+            if acted(reply):
+                break
+            log.warning("the model described the action without doing it: nudge %d", attempt + 1)
+            nudge = list(msgs)
+            if reply.text.strip():
+                nudge.append({"role": "assistant", "content": reply.text})
+            nudge.append({"role": "user", "content": self.act_nudge})
+            ptoks = self._prompt_tokens(nudge, tools_tokens)
+            plan = self._plan(c, n_ctx, ptoks)
+            if not plan["fits"]:
+                break
+            try:
+                r2 = self._turn_once(c, nudge, plan["max_out"], False, "required" if c.tools else None,
+                                     None, ptoks, c.tools)
+            except ModelError as exc:
+                meta["action_retry_error"] = str(exc)
+                break
+            if names and not r2.tool_calls:
+                calls, rest = parse_tool_calls_from_text(r2.text, names)
+                if calls:
+                    r2.tool_calls, r2.text = calls, rest
+            meta["action_retries"] = attempt + 1
+            if acted(r2) or (r2.text and not reply.text):
+                r2.tokens += reply.tokens
+                reply = r2
+        return reply
+
+    # -- message reduction (prompt larger than the context) -------------------
+    def _simple_completion(self, prompt: str, system: str, max_tokens: int) -> str:
+        c = _Call([{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                  temperature=0.0, max_tokens=max_tokens, continua=False, stream=False)
+        ptoks = self._prompt_tokens(c.msgs)
+        return self._turn_once(c, c.msgs, max_tokens, False, None, None, ptoks, None).text.strip()
+
+    def _llm_extract(self, piece: str, question: str, per_tokens: int) -> str:
+        prompt = self.extract_prompt.format(question=question[:500], a="<<<DATA>>>", b="<<<END>>>",
+                                            text=piece.replace("<<<", "< < <"))
+        out = self._simple_completion(prompt, "You extract context. Be concise.", min(400, per_tokens + 40))
+        if out.strip(" .\n").upper() == "NONE":
+            return ""
+        return out[: int(per_tokens * 3.2)]
+
+    def _reduce_text(self, text: str, question: str, target: int) -> str:
+        original = text
+        use_llm = self.auto_reduce_mode != "local"
+        for _round in range(3):
+            if estimate_tokens(text) <= target:
+                return text
+            piece_tok = max(100, min(1200, target // 2))
+            pieces = [p.text for p in split_text(text, "text", max_tokens=piece_tok, max_chars=int(piece_tok * 3.2),
+                                                 min_chars=100, overlap=0)]
+            per = max(40, target // max(1, len(pieces)))
+            llm = use_llm and len(pieces) <= self.reduce_llm_max_pieces and per >= 60
+            outs: List[str] = []
+            for p in pieces:
+                r: Optional[str] = None
+                if llm:
+                    try:
+                        r = self._llm_extract(p, question, per)
+                    except ModelError as exc:
+                        log.warning("model extraction failed (%s): switching to local extraction", exc)
+                        llm = use_llm = False
+                if r is None:
+                    r = extract_local(p, question, per)
+                if r:
+                    outs.append(r)
+            text = "\n".join(outs)
+            if not text:
+                keep = max(200, int(target * 3.2))
+                log.warning("reduction produced nothing: keeping head and tail of the original")
+                return original[: keep // 2] + "\n[...]\n" + original[-(keep // 2):]
+        if estimate_tokens(text) > target:
+            keep = int(target * 3.2)
+            text = text[: keep // 2] + "\n[...]\n" + text[-(keep // 2):]
+        return text
+
+    def _drop_old_history(self, msgs: List[Dict[str, Any]], budget: int, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Drop the OLDEST non-system messages until the conversation fits ``budget`` tokens.
+
+        The last message is never dropped. Cheaper and safer than summarising: nothing is invented.
+        """
+        cost = self._prompt_tokens
+        out = list(msgs)
+        dropped = 0
+        while cost(out) > budget:
+            first = next((i for i, m in enumerate(out[:-1]) if m.get("role") != "system"), None)
+            if first is None:
+                break
+            del out[first]
+            dropped += 1
+        if dropped:
+            meta["history_dropped"] = dropped
+            log.warning("dropped the %d oldest message(s) to fit the context", dropped)
+        return out
+
+    def _reduce_messages(self, msgs: List[Dict[str, Any]], budget: int, question: Optional[str],
+                         meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+        msgs = self._drop_old_history(msgs, budget, meta)
+        idxs = [i for i, m in enumerate(msgs) if m.get("role") != "system"]
+        if not idxs:
+            return msgs
+        if self._prompt_tokens(msgs) <= budget:
+            return msgs
+        big = max(idxs, key=lambda i: len(_as_text(msgs[i].get("content"))))
+        text = _as_text(msgs[big].get("content"))

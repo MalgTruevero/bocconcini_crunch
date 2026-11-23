@@ -1,0 +1,414 @@
+KEYS: ['sec_000'] TOTAL: 1
+=== prepara_albero_ricco (/data/data/com.termux/files/home/bocconcini_crunch/bocconcini/memory.py:834) ===
+ 834: def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"] = None, 
+ 835:                           max_chars: int = 1500, max_per_tipo: int = 100, tetto_fatti: int = 180, mode="auto", max_children=None, client=None) -> Tuple["DocTree", str]:
+ 836:     """Costruisce un albero con summary arricchiti dai fatti deterministici.
+ 837:     
+ 838:     Chunka il documento, estrae tutti i fatti con trova_fatti(), e per ogni chunk
+ 839:     inserisce nel summary i fatti che cadono in quel range. Questo rende i fatti
+ 840:     visibili nell'indice senza dover aprire i rami.
+ 841:     
+ 842:     Args:
+ 843:         documento: testo completo da indicizzare
+ 844:         sessione: nome della sessione per DocTree
+ 845:         tree: DocTree esistente (se None, usa ~/.cache/bocconcini/workspace)
+ 846:         max_chars: dimensione massima dei chunk
+ 847:         max_per_tipo: quanti fatti estrarre per tipo (default 100 invece di 40)
+ 848:         tetto_fatti: max characters of the fact block in each summary (default 180).
+ 849:             Facts are ordered by GLOBAL RARITY of their type: a type with 4 hits in
+ 850:             the document is signal, one with 100 hits is noise, so rare types are
+ 851:             rendered first. What does not fit is counted and declared, never dropped
+ 852:             in silence; the verbatim text of every branch stays on disk.
+ 853:     
+ 854:     Returns:
+ 855:         (tree, sessione) - il tree con l'albero salvato
+ 856:     
+ 857:     Example:
+ 858:         >>> import bocconcini as b
+ 859:         >>> import bocconcini_memory as t
+ 860:         >>> tree, session = t.prepara_albero_ricco(documento_enorme, "test")
+ 861:         >>> risultato = t.naviga(client, tree, session, domanda, budget_tokens=1500)
+ 862:     """
+ 863:     if tree is None:
+ 864:         tree = DocTree()
+ 865:     
+ 866:     # 1. Chunking del documento
+ 867:     chunks = split_text(documento, name="documento.txt", kind="text", 
+ 868:                        max_chars=max_chars, max_tokens=10000, min_chars=300, overlap=0)
+ 869:     
+ 870:     # 2. Estrazione deterministica di tutti i fatti
+ 871:     tutti_i_fatti = trova_fatti(documento, max_per_tipo=max_per_tipo)
+ 872:     fact_counts = {}
+ 873:     for f in tutti_i_fatti:
+ 874:         fact_counts[f["tipo"]] = fact_counts.get(f["tipo"], 0) + 1
+ 875:     signal_rank = {t: i for i, t in enumerate(sorted(fact_counts, key=lambda t: (fact_counts[t], t)))}
+ 876:     
+ 877:     # 3. Costruzione dei nodi con summary arricchiti
+ 878:     roots = []
+ 879:     for i, ch in enumerate(chunks):
+ 880:         node_id = f"sec_{i:03d}"
+ 881:         
+ 882:         # Etichetta standard
+ 883:         meta_etichetta = etichetta(ch.text, name="documento.txt")
+ 884:         
+ 885:         # Trova i fatti che cadono in questo chunk
+ 886:         fatti_nel_chunk = [
+ 887:             f"{f['tipo']}:{f['valore']}" 
+ 888:             for f in tutti_i_fatti 
+ 889:             if ch.start <= f['pos'] < ch.end
+ 890:         ]
+ 891:         
+ 892:         # Arricchisci il summary
+ 893:         # Rarest fact types first: 100 hits of a type is noise, 4 hits is signal.
+ 894:         fatti_nel_chunk.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
+ 895:         summary_base = meta_etichetta["summary"]
+ 896:         if fatti_nel_chunk:
+ 897:             visibili, usati = [], 0
+ 898:             for f in fatti_nel_chunk:
+ 899:                 f = f if len(f) <= 80 else f[:77] + "..."
+ 900:                 if visibili and usati + len(f) + 2 > tetto_fatti:
+ 901:                     break
+ 902:                 visibili.append(f)
+ 903:                 usati += len(f) + 2
+ 904:             blocco = "CHIAVE -> " + ", ".join(visibili)
+ 905:             resto = len(fatti_nel_chunk) - len(visibili)
+ 906:             if resto:
+ 907:                 blocco += " (+%d altri nel ramo)" % resto
+ 908:             summary_base = blocco + (" | " + summary_base if summary_base else "")
+ 909:         
+ 910:         roots.append(DocNode(
+ 911:             id=node_id,
+ 912:             label=f"Sezione {i} (pos {ch.start}-{ch.end})",
+ 913:             summary=summary_base,
+ 914:             text=ch.text,
+ 915:             tokens=ch.token_count_estimate()
+ 916:         ))
+ 917:     
+ 918:     # 4. Salvataggio dell'albero
+ 919:     # --- Matriosca: raggruppa le foglie in macro-blocchi padre->figli ---
+ 920:     if max_children is None:
+ 921:         if client is not None:
+ 922:             try:
+ 923:                 max_children = int(matrioska_profile(client).get("max_children", 8))
+ 924:             except Exception:
+ 925:                 max_children = 8
+ 926:         else:
+ 927:             max_children = 8
+ 928:     max_children = max(2, int(max_children))
+ 929:     if mode in ("matriosca", "auto") and len(roots) > max_children:
+ 930:         foglie = roots
+ 931:         roots = []
+ 932:         for g in range(0, len(foglie), max_children):
+ 933:             gruppo = foglie[g:g + max_children]
+ 934:             inizio = chunks[g].start
+ 935:             fine = chunks[g + len(gruppo) - 1].end
+ 936:             blocco = _fatti_in_range(tutti_i_fatti, inizio, fine, signal_rank, tetto_fatti)
+ 937:             if not blocco:
+ 938:                 # Fallback: eredita i summary delle foglie (termini frequenti, numeri)
+ 939:                 parti = [c.summary for c in gruppo if c.summary]
+ 940:                 if parti:
+ 941:                     blocco = " | ".join(parti)
+ 942:                     if len(blocco) > tetto_fatti * 2:
+ 943:                         blocco = blocco[:tetto_fatti * 2 - 3] + "..."
+ 944:             roots.append(DocNode(
+ 945:                 id="macro_%02d" % (g // max_children),
+ 946:                 label="Macro-blocco %d (sezioni %d-%d)" % (g // max_children, g, g + len(gruppo) - 1),
+ 947:                 summary=blocco,
+ 948:                 text="",
+ 949:                 tokens=sum(c.tokens for c in gruppo),
+ 950:                 children=gruppo,
+ 951:             ))
+ 952:     tree.save(sessione, roots)
+ 953:     
+ 954:     return tree, sessione
+
+=== naviga (/data/data/com.termux/files/home/bocconcini_crunch/bocconcini/memory.py:486) ===
+ 486: def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
+ 487:            budget_tokens: Optional[int] = None, chars_per_token: float = 3.2,
+ 488:            max_hops: Optional[int] = None, max_repeats: int = 2, max_tokens: int = 400,
+ 489:            temperature: float = 0.2, require_read: bool = True, max_calls: Optional[int] = None) -> Dict[str, Any]:
+ 490:     """The model navigates, Python informs and enforces the budget.
+ 491: 
+ 492:     ``max_hops`` reads, then ONE final turn with no tools: the model answers with
+ 493:     what it has, or says it does not know. An invented id is answered with the
+ 494:     list of real ones, because a small model deduces ids instead of copying them.
+ 495:     Eviction is declared and reversible: the text never leaves the disk.
+ 496:     """
+ 497:     budget = int(budget_tokens or client.working_budget(reserve=0))
+ 498:     cpt = max(1.0, float(chars_per_token))
+ 499:     try:
+ 500:         ovh = float(client._hw().get("msg_overhead") or 8.0)
+ 501:     except Exception:
+ 502:         ovh = 8.0
+ 503:     meta: Dict[str, Any] = {"hops": 0, "nodes_read": [], "evicted": 0, "repeats": 0,
+ 504:                             "branches_cut": [], "unknown_ids": [], "forced_answer": False,
+ 505:                             "answered_from_index": False, "stopped": "", "budget": budget}
+ 506:     roots = tree.index(session).get("nodes") or []
+ 507:     focus = None
+ 508:     if len(roots) == 1 and roots[0].get("children"):
+ 509:         focus = str(roots[0]["id"])        # bare container: show the useful level immediately
+ 510:     shown = _level_ids(tree, session, focus)
+ 511:     vista = tree.vista(session, focus, budget_tokens=max(150, budget // 4), chars_per_token=cpt)
+ 512:     toks = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question))
+ 513:     named = [k for k in tree.keys(session) if k.rsplit(".", 1)[-1] in toks][:3]
+ 514:     hint = ("\n\nNomi della domanda presenti nell'albero (id completi): " + ", ".join(named)) if named else ""
+ 515:     msgs: List[Dict[str, Any]] = [
+ 516:         {"role": "system", "content": _REGOLE + "\n\n" + vista["text"] + hint},
+ 517:         {"role": "user", "content": question}]
+ 518:     seen: Dict[str, int] = {}
+ 519:     answer = ""
+ 520:     if max_hops is None: max_hops = matrioska_profile(client)["max_hops"]
+ 521:     hops = max(0, int(max_hops))
+ 522:     if max_calls is None: max_calls = matrioska_profile(client)["max_calls"]
+ 523:     for turn in range(hops + 1):
+ 524:         if meta.get("_notice"):
+ 525:             msgs.append({"role": "user", "content": meta.pop("_notice")})
+ 526:         final = turn >= hops
+ 527:         tools_now = None if final else [_LEGGI, _CERCA, _SFOGLIA]
+ 528:         tt = _tools_tokens(client, tools_now)
+ 529:         meta["evicted"] += _evict(msgs, max(200, budget - max_tokens), cpt, ovh, question, cost=lambda ms: client._prompt_tokens(ms, tt))
+ 530:         try:
+ 531:             tt = _tools_tokens(client, tools_now)
+ 532:             pt = client._prompt_tokens(msgs, tt)
+ 533:         except Exception:
+ 534:             pt = _msg_tokens(msgs, cpt, ovh) + (256 if tools_now else 0)
+ 535:         if pt > budget:
+ 536:             meta["stopped"] = "budget: prompt ~%d > %d" % (pt, budget)
+ 537:             break
+ 538:         cap = _read_cap(client, msgs, tt, budget, max_tokens if final else 0, max_calls, cpt); meta.setdefault("caps",[]).append(cap)
+ 539:         if final:
+ 540:             meta["forced_answer"] = True
+ 541:         try:
+ 542:             cs = meta.get("_consecutive_searches", 0)
+ 543:             if require_read and not meta["nodes_read"] and not final and cs >= 2:
+ 544:                 tc = {"type": "function", "function": {"name": "leggi_nodo"}}
+ 545:             else:
+ 546:                 tc = "required" if (require_read and not meta["nodes_read"] and not final) else None
+ 547:             r = client.chat_full(messages=msgs, tools=tools_now, tool_choice=tc,
+ 548:                                  temperature=temperature, max_tokens=max_tokens, continua=False)
+ 549:         except Exception as exc:
+ 550:             meta["stopped"] = "error: %s" % exc
+ 551:             break
+ 552:         if not r.tool_calls:
+ 553:             if require_read and not meta["nodes_read"] and not final and not meta.get("nudged"):
+ 554:                 meta["nudged"] = True
+ 555:                 msgs.append({"role": "user", "content": "Non hai letto nessun ramo. L'indice non e' il documento: chiama cerca_nodo o leggi_nodo prima di rispondere."})
+ 556:                 continue
+ 557:             answer = r.text
+ 558:             break
+ 559:         meta["hops"] += 1
+ 560:         calls = [c for c in r.tool_calls if str(c.get("function", {}).get("name")) == "cerca_nodo"][:4] + [c for c in r.tool_calls if str(c.get("function", {}).get("name")) != "cerca_nodo"][:max(1, int(max_calls))]
+ 561:         if len(r.tool_calls) > len(calls):
+ 562:             meta["deferred"] = meta.get("deferred", 0) + len(r.tool_calls) - len(calls)
+ 563:             meta["_notice"] = ("[%d calls asked, %d honoured; "
+ 564:                                "ask the rest one per turn.]" % (len(r.tool_calls), len(calls)))
+ 565:         msgs.append({"role": "assistant", "content": r.text or "", "tool_calls": calls})
+ 566:         valid = tree.keys(session)
+ 567:         reads_turn = 0
+ 568:         for call in calls:
+ 569:             try:
+ 570:                 args = json.loads(call.get("function", {}).get("arguments") or "{}")
+ 571:             except ValueError:
+ 572:                 args = {}
+ 573:             fname = str(call.get("function", {}).get("name") or "")
+ 574:             if fname == "cerca_nodo":
+ 575:                 q = str(args.get("query") or args.get("id") or "")
+ 576:                 qn = q.strip().lower()
+ 577:                 cache = meta.setdefault("_search_cache", {})
+ 578:                 if qn in cache:
+ 579:                     body = "[repeat: %s] ids: %s. Read a LEAF." % (q, cache[qn] or "none")
+ 580:                     _h = []
+ 581:                 else:
+ 582:                     body, _h = _cerca(tree, session, q, 4)
+ 583:                     cache[qn] = ", ".join(_h[:4])
+ 584:                 meta.setdefault("searches", []).append(q)
+ 585:                 consecutive_searches = meta.get('_consecutive_searches', 0) + 1
+ 586:                 meta['_consecutive_searches'] = consecutive_searches
+ 587:                 msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": body, "_node": ""})
+ 588:                 continue
+ 589:             if fname == "sfoglia_pagina":
+ 590:                 off = int(args.get("offset") or 0)
+ 591:                 sub = tree.vista(session, focus, budget_tokens=max(150, budget // 4), chars_per_token=cpt, offset=off)
+ 592:                 meta.setdefault("pages_browsed", []).append(off)
+ 593:                 msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": sub["text"], "_node": ""})
+ 594:                 continue
+ 595:             if fname in ("leggi_nodo",):
+ 596:                 meta['_consecutive_searches'] = 0  # Reset contatore ricerche consecutive
+ 597: 
+ 598:             if fname not in ("", "leggi_nodo"):
+ 599:                 msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": "[strumento sconosciuto: usa leggi_nodo o cerca_nodo]", "_node": ""})
+ 600:                 continue
+ 601:             nid = str(args.get("id") or ""); o = max(0, int((re.findall(r"\d+", str(args.get("offset") or 0)) or ["0"])[0]))
+ 602:             nf = ""
+ 603:             if not nid:
+ 604:                 meta["empty_ids"] = meta.get("empty_ids", 0) + 1
+ 605:                 sug = ", ".join(named or shown) or "(nessuno)"
+ 606:                 msgs.append({"role": "tool", "tool_call_id": call.get("id") or "",
+ 607:                              "content": "[id vuoto: chiama leggi_nodo con l'id completo di un ramo, es. %s]" % sug,
+ 608:                              "_node": ""})
+ 609:                 continue
+ 610:             if nid not in valid:
+ 611:                 bare = nid.rsplit(".", 1)[-1]
+ 612:                 cand = [k for k in valid if k.rsplit(".", 1)[-1] == bare]
+ 613:                 if len(cand) == 1:
+ 614:                     meta.setdefault("resolved_names", []).append("%s -> %s" % (nid, cand[0]))
+ 615:                     nid = cand[0]
+ 616:                 elif len(cand) > 1:
+ 617:                     meta.setdefault("ambiguous", []).append(nid)
+ 618:                     msgs.append({"role": "tool", "tool_call_id": call.get("id") or "",
+ 619:                                  "content": "[nome ambiguo: usa l'id completo, uno di questi: %s]"
+ 620:                                             % ", ".join(cand[:6]), "_node": nid})
+ 621:                     continue
+ 622:             if nid not in valid:
+ 623:                 meta["unknown_ids"].append(nid)
+ 624:                 body = ("[il ramo %r NON ESISTE. Non inventare id: copia uno di questi, che sono "
+ 625:                         "quelli elencati: %s]" % (nid, ", ".join(shown) or "(nessuno)"))
+ 626:             elif seen.get((nid, o), 0) >= max_repeats and any((m.get("_node"), m.get("_off", 0))==(nid, o) and not m.get("_stub") for m in msgs):
+ 627:                 meta["repeats"] += 1
+ 628:                 body = ("[hai gia' letto il ramo %s %d volte: non te lo rimando. Usa quello che "
+ 629:                         "hai, o chiedi un altro ramo.]" % (nid, seen.get((nid, o), 0)))
+ 630:             elif reads_turn and _msg_tokens(msgs, cpt, ovh) + int(min(cap, int(valid.get(nid, {}).get("chars") or cap)) / cpt) + 8 > max(200, budget - max_tokens):
+ 631:                 meta["deferred"] = meta.get("deferred", 0) + 1
+ 632:                 body = ("[branch %s NOT read: this turn already carries %d branch(es). "
+ 633:                         "Ask for it again on the next turn.]" % (nid, reads_turn))
+ 634:             else:
+ 635:                 reads_turn += 1
+ 636:                 try:
+ 637:                     full = tree.load(session, nid)
+ 638:                     meta["nodes_read"].append(nid)
+ 639:                     seen[(nid, o)] = seen.get((nid, o), 0) + 1
+ 640:                     body = full
+ 641:                     nf = ", ".join("%s:%s" % (f["tipo"], f["valore"]) for f in trova_fatti(full, max_per_tipo=6))[:180]
+ 642:                     if len(body) > cap:
+ 643:                         body = full[o:o+cap] + (chr(10)+'[%d/%d chars; next leggi_nodo(id=%s, offset=%d)]' % (o+cap, len(full), nid, o+cap))
+ 644:                         if o+cap >= len(full): body = full[o:] + (chr(10)+'[end of branch %s: %d chars]' % (nid, len(full)))
+ 645:                         meta["branches_cut"].append(nid)
+ 646:                     kids = valid.get(nid, {}).get("children")
+ 647:                     if kids:
+ 648:                         shown = [str(c["id"]) for c in kids]
+ 649:                         sub = tree.vista(session, nid, budget_tokens=max(120, budget // 4),
+ 650:                                          chars_per_token=cpt)
+ 651:                         body += ("\n\n[questo ramo e' un contenitore: chiama leggi_nodo con UNO "
+ 652:                                  "di questi id]\n" + sub["text"])
+ 653:                     elif not full.strip():
+ 654:                         body = "[il ramo %s non contiene testo]" % nid
+ 655:                 except TreeError as exc:
+ 656:                     body = "[ramo non leggibile: %s]" % exc
+ 657:                     meta.setdefault("unreadable", []).append(nid)
+ 658:             msgs.append({"role": "tool", "tool_call_id": call.get("id") or "",
+ 659:                          "content": body, "_node": nid, "_off": o, "_facts": nf})
+ 660:     if answer and not meta["nodes_read"]:
+ 661:         meta["answered_from_index"] = True
+ 662:     if not answer and not meta["stopped"]:
+ 663:         meta["stopped"] = "no_answer"
+ 664:     tt = _tools_tokens(client, tools_now)
+ 665:     meta["evicted"] += _evict(msgs, budget, cpt, ovh, question, cost=lambda ms: client._prompt_tokens(ms, tt))
+ 666:     return {"text": answer, "meta": meta, "messages": msgs}
+
+=== ask_stepwise (/data/data/com.termux/files/home/bocconcini_crunch/bocconcini/memory.py:996) ===
+ 996: def ask_stepwise(client, documento: str, question: str, *, targets=None,
+ 997:                  max_tokens: Optional[int] = None, window: Optional[int] = None, per_target: Optional[int] = None,
+ 998:                  temperature: float = 0.0) -> Dict[str, Any]:
+ 999:     """One target at a time, each in a FRESH context. Python keeps the findings.
+1000: 
+1001:     The model never has to remember what it already did: every sub-task starts
+1002:     with an empty history and sees only the verbatim windows for ITS target.
+1003:     The answers accumulate outside the model, so nothing is ever evicted.
+1004:     """
+1005:     low = documento.lower()
+1006:     if max_tokens is None:
+1007:         max_tokens = matrioska_profile(client)["answer_tokens"]
+1008:     if window is None:
+1009:         frasi = [len(f) for f in documento.split('.') if len(f) > 10]
+1010:         avg_frase = sum(frasi) // max(1, len(frasi)) if frasi else 100
+1011:         window = max(100, avg_frase * 2)
+1012:     if per_target is None:
+1013:         per_target = float('inf')
+1014:     if not targets:
+1015:         r = client.chat_full(prompt=("List the distinct items to find in this request, "
+1016:                                      "one per line, no numbering, no explanation.\nRequest: "
+1017:                                      + question), max_tokens=60, temperature=0.0, continua=False)
+1018:         targets = [ln.strip(" -\t0123456789.") for ln in (r.text or "").splitlines()]
+1019:         targets = [x for x in targets if 2 < len(x) <= 40][:8]
+1020:     findings, calls, biggest = [], 0, 0
+1021:     for tg in targets:
+1022:         q = str(tg).lower().strip()
+1023:         wins, start = [], 0
+1024:         # Hard limit: la finestra NON DEVE MAI sforare il budget cognitivo
+1025:         hard_limit = max(window, min(int(max_tokens * 3.2 * 1.5), window * 4))
+1026:         while len(wins) < per_target:
+1027:             k = low.find(q, start)
+1028:             if k < 0:
+1029:                 break
+1030:             
+1031:             # 1. Confini naturali (frase/paragrafo)
+1032:             a_nat, b_nat = k, k + len(q)
+1033:             while a_nat > 0 and documento[a_nat-1] not in ".!?\n": a_nat -= 1
+1034:             while b_nat < len(documento) and documento[b_nat] not in ".!?\n": b_nat += 1
+1035:             
+1036:             # 2. Se la frase naturale entra nel budget, usala intera
+1037:             if (b_nat - a_nat) <= hard_limit:
+1038:                 a, b = a_nat, b_nat
+1039:             else:
+1040:                 # 3. IL CONTRARIO: la frase sfora, contraila al budget centrando su q
+1041:                 a = max(0, k - hard_limit // 2)
+1042:                 b = min(len(documento), k + len(q) + hard_limit // 2)
+1043:                 # Aggiusta i bordi per non tagliare parole a meta'
+1044:                 if a > 0:
+1045:                     space = documento.find(" ", a, a + 40)
+1046:                     if space != -1 and space < a + 40: a = space + 1
+1047:                 if b < len(documento):
+1048:                     space = documento.rfind(" ", max(a, b - 40), b)
+1049:                     if space != -1: b = space
+1050:                     
+1051:             wins.append(documento[a:b].replace("\n", " "))
+1052:             start = k + len(q)
+1053:         if not wins:
+1054:             findings.append((tg, "NOT FOUND"))
+1055:             continue
+1056:         p = ("ORIGINAL REQUEST: " + str(question) + "\n\n"
+1057:              + "VERBATIM EXCERPTS (from the document):\n"
+1058:              + "\n".join("- " + w for w in wins) + "\n\n"
+1059:              + "In the excerpts above, copy the EXACT text that appears next to '" + str(tg) + "' "
+1060:              + "(a code, number, date, name, or status that specifies it). "
+1061:              + "Copy it character for character from the excerpts. Do not paraphrase, do not invent.\n"
+1062:              + "If the excerpts contain nothing next to '" + str(tg) + "', reply NOT FOUND.\n"
+1063:              + "Answer with the copied text only (no preamble, no quotes).")
+1064:         biggest = max(biggest, len(p))
+1065:         r = client.chat_full(prompt=p, max_tokens=max_tokens,
+1066:                              temperature=temperature, continua=False)
+1067:         calls += 1
+1068:         findings.append((tg, (r.text or "").strip()))
+1069:     # Filtra i NOT FOUND e presenta solo i valori trovati
+1070:     found = [(k, v) for k, v in findings if v != "NOT FOUND" and v.strip() != ""]
+1071:     if not found:
+1072:         # Nessuno trovato: rispondi direttamente senza chiamare il modello
+1073:         return {"text": "NOT FOUND: nessun valore estratto per la richiesta.",
+1074:                 "meta": {"targets": list(targets), "findings": findings,
+1075:                          "sub_calls": calls, "biggest_prompt_chars": biggest,
+1076:                          "synthesis_skipped": True}}
+1077:     
+1078:     righe = "\n".join("%s: %s" % (k, v) for k, v in found)
+1079:     not_found_count = len(findings) - len(found)
+1080:     
+1081:     # Costruisci il prompt con contesto esplicito
+1082:     p = ("ORIGINAL REQUEST: " + str(question) + "\n\n"
+1083:          + "EXTRACTED VALUES:\n" + righe + "\n\n")
+1084:     
+1085:     if not_found_count > 0:
+1086:         p += ("Note: " + str(not_found_count) + " target(s) had no clear associated value "
+1087:               + "in the document.\n")
+1088:     
+1089:     p += ("Using ONLY the extracted values above, answer the original request.\n"
+1090:           + "If the values are sufficient, provide a complete answer.\n"
+1091:           + "If the values are insufficient, say 'INSUFFICIENT DATA' and explain what is missing.\n"
+1092:           + "Do not invent values that are not in the extracted list.")
+1093:     
+1094:     biggest = max(biggest, len(p))
+1095:     synth_tokens = max_tokens if max_tokens else matrioska_profile(client)["answer_tokens"]
+1096:     r = client.chat_full(prompt=p, max_tokens=synth_tokens, temperature=temperature, continua=False)
+1097:     
+1098:     return {"text": r.text or "", "meta": {"targets": list(targets), "findings": findings,
+1099:                                            "sub_calls": calls + 1, "biggest_prompt_chars": biggest,
+1100:                                            "found_count": len(found), "not_found_count": not_found_count}}
+
