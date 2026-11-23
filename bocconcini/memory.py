@@ -769,11 +769,6 @@ def _nodo(lines: List[str], lo: int, hi: int, body: List[Any], ident: str,
     spans = sorted((_span(n), n) for n in body if isinstance(n, _DEFNODES))
     kids = [_nodo(lines, a, b, getattr(n, "body", []), ident + "." + n.name,
                   _sig(n), n, count) for (a, b), n in spans]
-    child_lines: set = set()
-    for k in kids:
-        if k.text:
-            for line in k.text.splitlines():
-                child_lines.add(line)  # non usiamo questo: righe duplicate esistono
     # Approccio più robusto: ogni figlio occupa esattamente le righe che contiene il suo testo
     covered_real: set = set()
     for k in kids:

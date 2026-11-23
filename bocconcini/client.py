@@ -2675,7 +2675,6 @@ class LlamaCppClient:
             return msgs
         from .rami import Spill, spill_messaggi
         if self._store is None:
-            import tempfile
             default_spill = self.spill_dir or os.path.expanduser("~/.cache/bocconcini/spill")
             os.makedirs(default_spill, exist_ok=True)
             self._store = Spill(default_spill)
