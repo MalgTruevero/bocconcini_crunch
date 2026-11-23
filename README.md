@@ -59,14 +59,11 @@ Python 3.7+. **No runtime dependencies.** On PyPI.
 
     pip install bocconcini
 
-Offline / Termux — no pip, no build, two files:
 
-    curl -O https://raw.githubusercontent.com/MalgTruevero/bocconcini_crunch/main/bocconcini.py
-    curl -O https://raw.githubusercontent.com/MalgTruevero/bocconcini_crunch/main/bocconcini_tree.py
 
 ## First result — no model, no server
 
-    from bocconcini_tree import trova_fatti
+    from bocconcini import trova_fatti
     doc = "filler " * 4000 + "The unlock code is ALFA-1." + "filler " * 4000
     print(trova_fatti(doc))
 
@@ -99,7 +96,7 @@ Needs a running llama.cpp / KoboldCpp server. **Verified live: KoboldCpp only.**
 Ollama and OpenAI-compatible cloud paths are implemented but **not verified live**.
 ## Finding facts without blind compression
 
-    from bocconcini_tree import trova_fatti
+    from bocconcini import trova_fatti
     facts = trova_fatti(document)      # reads every character, no model call
     context = "\n".join(f["contesto"] for f in facts)
 

@@ -1,4 +1,4 @@
-"""bocconcini_docs - read long documents (PDF text, books, mixed prose + code) with a small model.
+"""bocconcini.docs - read long documents (PDF text, books, mixed prose + code) with a small model.
 
 Standard library only (+ the optional ``pdftotext`` binary for PDFs). Companion of ``bocconcini``.
 
@@ -12,7 +12,7 @@ The idea, in three rules
 Quick start::
 
     from bocconcini import LlamaCppClient
-    from bocconcini_docs import analyze, read_pdf_pages
+    from bocconcini.docs import analyze, read_pdf_pages
 
     client = LlamaCppClient("http://127.0.0.1:8082")
     pages = read_pdf_pages("manual.pdf")              # needs: pkg install poppler

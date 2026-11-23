@@ -1,4 +1,4 @@
-"""bocconcini 4.3 - split text/Python/JSON into LLM-sized chunks and talk to a
+"""bocconcini 5.0 - split text/Python/JSON into LLM-sized chunks and talk to a
 local llama.cpp / KoboldCpp / Ollama / OpenAI-compatible server.
 
 Standard library only, Python >= 3.7, thread-safe. Born on a Samsung S20 Ultra
@@ -38,6 +38,20 @@ Small context windows
     inconclusive one changes nothing. You can set it by hand: ``cognitive_limit=`` or
     BOCCONCINI_COGNITIVE_LIMIT; BOCCONCINI_NO_COGNITIVE=1 ignores it.
 
+CHANGELOG 5.0.0 (changes to 4.3.0; verified on the installed wheel)
+
+  * Layout: monolith split into client/docs/memory/rami; bocconcini_tree
+    returns as a deprecated shim (removed in 6.0); import from bocconcini.
+  * matrioska_profile: fixed ceilings removed; budgets scale with usable.
+  * reserve: guessed 640 replaced by furniture_tokens(rules+tool schema,
+    exact counts cached in token_costs.json) + overhead * messages.
+  * cognitive margin: -10% replaced by -4 tokens; refusal at cog_raw.
+  * _drop_old_history: no orphan tool results; drops archived on disk.
+  * ask_stepwise: bounded batched prompts; identical windows deduped.
+  * naviga: focus follows the node just read; max_hops default =
+    max(profile floor, tree depth + max_repeats + 1).
+  * docs: ships as bocconcini.docs (docs.py); top-level bocconcini_docs
+    of 4.1.0 stays absent (historical note in 4.3.0 below).
 CHANGELOG 4.3.0 (changes to the 4.2.0 file; checked against a fake server, not a live one)
   * The cognitive window is never measured inside a request any more (it blocked the first big
     request for minutes) and a failed first probe is no longer stored as a 256-token floor that
@@ -146,7 +160,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-__version__ = "4.3.0"
+__version__ = "5.0.0"
 __all__ = [
     "Chunk", "ChatReply", "ModelError", "TokenCounter", "TokenCounterLike",
     "estimate_tokens", "detect_kind", "iter_chunks", "split_text", "split_thinking", "strip_thinking",
@@ -1095,7 +1109,69 @@ TokenCounter = LlamaServerTokenizer   # name used by 3.24
 # ----------------------------------------------------------------------------
 # One job at a time per server (re-entrant) + busy notifications
 # ----------------------------------------------------------------------------
-_GATES: Dict[str, "threading.RLock"] = {}
+class _ReentrantSemaphore:
+    """Semaphore with capacity N, but re-entrant for the same thread (no deadlock on nested calls)."""
+    def __init__(self, capacity: int):
+        self._sem = threading.Semaphore(max(1, capacity))
+        self._local = threading.local()
+    def acquire(self, timeout: Optional[float] = None) -> bool:
+        count = getattr(self._local, "count", 0)
+        if count > 0:
+            self._local.count = count + 1
+            return True
+        if not self._sem.acquire(timeout=timeout if timeout is not None else -1):
+            return False
+        self._local.count = 1
+        return True
+    def release(self) -> None:
+        count = getattr(self._local, "count", 0)
+        if count <= 1:
+            self._local.count = 0
+            self._sem.release()
+        else:
+            self._local.count = count - 1
+
+def _probe_parallelism(base_url: str) -> int:
+    """HTTP probe to /slots to measure server parallel capacity. Returns 1 on failure."""
+    try:
+        import urllib.request, json
+        url = base_url.rstrip("/") + "/slots"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=2) as r:
+            data = json.loads(r.read())
+            return len(data) if isinstance(data, list) else 1
+    except Exception:
+        return 1
+
+def _load_parallel_cache(base_url: str) -> Optional[int]:
+    """Load cached parallel capacity from hardware_profile.json."""
+    try:
+        from pathlib import Path
+        cache_file = Path.home() / ".cache" / "bocconcini" / "hardware_profile.json"
+        if cache_file.exists():
+            import json
+            data = json.loads(cache_file.read_text())
+            key = base_url.rstrip("/").lower()
+            return data.get(key + "_parallel")
+    except Exception:
+        pass
+    return None
+
+def _save_parallel_cache(base_url: str, capacity: int) -> None:
+    """Save parallel capacity to hardware_profile.json."""
+    try:
+        from pathlib import Path
+        cache_file = Path.home() / ".cache" / "bocconcini" / "hardware_profile.json"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        data = json.loads(cache_file.read_text()) if cache_file.exists() else {}
+        key = base_url.rstrip("/").lower()
+        data[key + "_parallel"] = capacity
+        cache_file.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+_GATES: Dict[str, _ReentrantSemaphore] = {}
 _GATE_DEPTH: Dict[str, int] = {}
 _GATE_MUTEX = threading.Lock()
 _BUSY_SINCE: Dict[str, float] = {}
@@ -1157,7 +1233,11 @@ def lavoro_atomico(base_url: str = "", blocca_altri: bool = True, timeout_attesa
         return
     key = _lock_key(base_url)
     with _GATE_MUTEX:
-        lk = _GATES.setdefault(key, threading.RLock())
+        cached = _load_parallel_cache(base_url)
+        if cached is None:
+            cached = _probe_parallelism(base_url)
+            _save_parallel_cache(base_url, cached)
+        lk = _GATES.setdefault(key, _ReentrantSemaphore(cached))
     if not lk.acquire(timeout=-1 if timeout_attesa is None else float(timeout_attesa)):
         raise ModelError("another job is still running on %s" % key, kind="busy")
     with _GATE_MUTEX:
@@ -1656,7 +1736,7 @@ class LlamaCppClient:
                  server_pid_file: Optional[str] = None, target_seconds: Optional[float] = None,
                  idle_limit: Optional[float] = None, modalita_tartaruga: bool = False,
                  tokenizer: Optional[Any] = None, verify_tls: bool = True, auto_reduce_mode: str = "auto",
-                 cognitive_limit: Optional[int] = None, **_ignored: Any) -> None:
+                 cognitive_limit: Optional[int] = None, spill: bool = False, **_ignored: Any) -> None:
         self.base_url = _check_base_url(base_url)
         if _ignored:
             log.warning("ignored arguments: %s", ", ".join(sorted(_ignored)))
@@ -1665,7 +1745,7 @@ class LlamaCppClient:
         self.model, self.timeout, self.api_key = model, timeout, api_key
         self.temperature_provider = temperature_provider
         self.n_ctx, self.auto_reduce, self.auto_max_tokens = n_ctx, auto_reduce, auto_max_tokens
-        self.spill, self.spill_dir, self._store = True, None, None
+        self.spill, self.spill_dir, self._store = spill, None, None
         self.persist_profile, self.target_seconds = persist_profile, target_seconds
         self.tokenizer, self.verify_tls, self.auto_reduce_mode = tokenizer, verify_tls, auto_reduce_mode
         self.cognitive_limit = int(cognitive_limit) if cognitive_limit else None
@@ -2025,7 +2105,7 @@ class LlamaCppClient:
     # -- one HTTP exchange ---------------------------------------------------
     def _payload(self, c: _Call, msgs: List[Dict[str, Any]], max_out: int, thinking: Optional[bool],
                  tool_choice: Any, tools: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
-        d: Dict[str, Any] = {"messages": msgs, "temperature": c.temperature, "stream": bool(c.stream)}
+        d: Dict[str, Any] = {"messages": [{k: v for k, v in m.items() if not k.startswith("_") and k not in ("ramo","pin")} for m in msgs], "temperature": c.temperature, "stream": bool(c.stream)}
         if self.model:
             d["model"] = self.model
         if max_out:
@@ -2577,14 +2657,16 @@ class LlamaCppClient:
         out = list(msgs)
         dropped = 0
         while cost(out) > budget:
-            first = next((i for i, m in enumerate(out[:-1]) if m.get("role") != "system"), None)
+            # Skip system, tool results, and the last message (the request)
+            first = next((i for i, m in enumerate(out[:-1]) 
+                         if m.get("role") not in ("system", "tool") and not m.get("_stub") and not m.get("tool_calls")), None)
             if first is None:
                 break
-            del out[first]
+            from .rami import archive_message; out[first] = archive_message(out[first], self, "hist%d" % first)
             dropped += 1
         if dropped:
-            meta["history_dropped"] = dropped
-            log.warning("dropped the %d oldest message(s) to fit the context", dropped)
+            meta["history_dropped"] = meta["history_archived"] = dropped
+            log.warning("archived %d oldest message(s) to disk", dropped)
         return out
 
     def _spill_if_needed(self, msgs, budget, meta):
@@ -2594,7 +2676,9 @@ class LlamaCppClient:
         from .rami import Spill, spill_messaggi
         if self._store is None:
             import tempfile
-            self._store = Spill(self.spill_dir or tempfile.mkdtemp(prefix="bocconcini_"))
+            default_spill = self.spill_dir or os.path.expanduser("~/.cache/bocconcini/spill")
+            os.makedirs(default_spill, exist_ok=True)
+            self._store = Spill(default_spill)
         out = spill_messaggi(msgs, self._store, soglia_caratteri=max(200, int(budget * 0.32)))
         rami = [m["ramo"] for m in out if m.get("ramo")]
         if rami:
@@ -2610,8 +2694,11 @@ class LlamaCppClient:
         # the cut instead of about what was asked. Only a document pipeline
         # (which passes reduce_question) may reduce it.
         last = len(msgs) - 1
-        idxs = [i for i, m in enumerate(msgs)
-                if m.get("role") not in ("system", "tool") and (question or i != last)]
+        if len(msgs) == 1:
+            idxs = [i for i, m in enumerate(msgs) if m.get("role") not in ("system", "tool")]
+        else:
+            idxs = [i for i, m in enumerate(msgs)
+                    if m.get("role") not in ("system", "tool") and (question or i != last)]
         if not idxs:
             meta["reduce_skipped"] = "only the request would be reducible"
             log.warning("nothing to reduce except the request: refusing to mangle it")
@@ -2741,20 +2828,25 @@ class LlamaCppClient:
         # The nominal window is not always the usable one: a small model can hold every token
         # and still lose the thread. A limit that was measured (calibra()) or set by hand is
         # applied here; it is never measured implicitly, so a request never waits for a test.
-        cog = 0 if os.environ.get("BOCCONCINI_NO_COGNITIVE") == "1" else (self._cog_stored() or 0)
+        cog_raw = 0 if os.environ.get("BOCCONCINI_NO_COGNITIVE") == "1" else (self._cog_stored() or 0)
+        cog = max(1, cog_raw - 4) if cog_raw else 0  # 4-token rounding slack: calibra() stores only PASSED probes
         if cog:
             meta["cognitive_limit"] = cog
+            meta["cognitive_limit_raw"] = cog_raw
             now = plan["usable"] - plan["free"]
             if now > cog:
                 if reduce_on:
                     msgs = self._reduce_messages(msgs, cog - tools_tokens, reduce_question, meta)
                     plan = self._plan(c, n_ctx, self._prompt_tokens(msgs, tools_tokens))
                     now = plan["usable"] - plan["free"]
-                if now > cog * 1.1:
+                if now > cog_raw:
                     raise ModelError(
                         "the prompt (~%d tokens) fits n_ctx=%d but exceeds the cognitive window "
-                        "(%d tokens): the answer would not be reliable. Pass auto_reduce=True or split "
-                        "the task." % (now, n_ctx, cog), kind="cognitive_overflow")
+                        "(%d tokens): the answer would not be reliable. %s" % (
+                            now, n_ctx, cog,
+                            "Pass auto_reduce=True or split the task." if not reduce_on
+                            else "Reduction tried but prompt still too big; split the task."),
+                        kind="cognitive_overflow")
         if not plan["fits"]:
             raise ModelError("the prompt (~%d tokens) does not fit n_ctx=%d%s" % (
                 self._prompt_tokens(msgs, tools_tokens), n_ctx, "" if info.get("detected") else

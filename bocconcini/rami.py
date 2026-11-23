@@ -98,8 +98,15 @@ def spill_messaggi(msgs, store, soglia_caratteri=640, prefisso="tool"):
             continue
         ident = store.put(c, etichetta="%s%d" % (prefisso, i))
         voce = dict(m)
-        voce["content"] = ('[ramo %s] %d byte su disco. Apri con leggi_ramo("%s"). %s'
-                           % (ident, len(c.encode("utf-8")), ident, _anteprima(c)))
+        voce['content'] = '[content on disk: id=%s, %d bytes. Preview: %s]' % (ident, len(c.encode()), _anteprima(c))
         voce["ramo"] = ident
         out.append(voce)
     return out
+
+def archive_message(m, client, label="hist"):
+    """Move one message content to disk; keep a reversible stub."""
+    if client._store is None:
+        import tempfile
+        client._store = Spill(client.spill_dir or tempfile.mkdtemp())
+    rid = client._store.put(m.get("content") or "", etichetta=label)
+    return dict(m, content="[content on disk: id=%s. Ask leggi_ramo for it]" % rid, ramo=rid, _stub=True)
