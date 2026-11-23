@@ -1746,6 +1746,13 @@ class LlamaCppClient:
             log.warning("ignored arguments: %s", ", ".join(sorted(_ignored)))
         if api_key and self.base_url.startswith("http://") and not _is_local(self.base_url):
             raise ValueError("refusing to send an api_key over plain http to a remote host")
+        if not model:
+            try:
+                detected = get_model_info(self.base_url).get("model", "")
+                if detected and detected != "unknown":
+                    model = detected
+            except Exception:
+                pass
         self.model, self.timeout, self.api_key = model, timeout, api_key
         self.temperature_provider = temperature_provider
         self.n_ctx, self.auto_reduce, self.auto_max_tokens = n_ctx, auto_reduce, auto_max_tokens
