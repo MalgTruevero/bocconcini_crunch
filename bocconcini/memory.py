@@ -362,6 +362,27 @@ def _evict(msgs: List[Dict[str, Any]], budget: int, cpt: float, per_msg: float =
             msgs[target]["content"] = "[esito precedente rimosso per fare spazio; usa cerca_nodo o leggi_nodo se ti serve]"
         msgs[target]["_stub"] = True
         removed += 1
+    
+    # Second pass: if still over budget, compress older assistant reasoning
+    while (cost(msgs) if cost is not None else _msg_tokens(msgs, cpt, per_msg)) > budget:
+        # Find the last assistant message to keep it intact
+        last_ai = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=-1)
+        target_ai = None
+        for i, m in enumerate(msgs):
+            if i < last_ai and m.get("role") == "assistant" and not m.get("_archived") and m.get("content"):
+                target_ai = i
+                break
+        
+        if target_ai is None:
+            break  # Nothing left to compress
+            
+        original_content = msgs[target_ai].get("content", "")
+        original_len = len(original_content)
+        msgs[target_ai]["_archived_content"] = original_content
+        msgs[target_ai]["content"] = f"[previous reasoning archived; {original_len} chars processed]"
+        msgs[target_ai]["_archived"] = True
+        removed += 1
+
     return removed
 
 
