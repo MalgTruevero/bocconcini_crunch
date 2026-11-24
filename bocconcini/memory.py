@@ -936,7 +936,7 @@ def _fatti_in_range(tutti_i_fatti, start, end, signal_rank, tetto_fatti):
 
 
 def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"] = None, 
-                          max_chars: int = 1500, max_per_tipo: int = 100, tetto_fatti: int = 180, mode="auto", max_children=None, client=None) -> Tuple["DocTree", str]:
+                          max_chars: int = 1500, max_per_tipo: int = 100, tetto_fatti: Optional[int] = None, mode="auto", max_children=None, client=None) -> Tuple["DocTree", str]:
     """Costruisce un albero con summary arricchiti dai fatti deterministici.
     
     Chunka il documento, estrae tutti i fatti con trova_fatti(), e per ogni chunk
@@ -949,7 +949,10 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
         tree: DocTree esistente (se None, usa ~/.cache/bocconcini/workspace)
         max_chars: dimensione massima dei chunk
         max_per_tipo: quanti fatti estrarre per tipo (default 100 invece di 40)
-        tetto_fatti: max characters of the fact block in each summary (default 180).
+        tetto_fatti: max characters of the fact block in each summary. None
+            (default) derives it from matrioska_profile(client): the fact part
+            of one index row is 4 * max_facts_per_summary tokens, converted with
+            the calibrated chars_per_token. An explicit value is honoured.
             Facts are ordered by GLOBAL RARITY of their type: a type with 4 hits in
             the document is signal, one with 100 hits is noise, so rare types are
             rendered first. What does not fit is counted and declared, never dropped
@@ -964,18 +967,20 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
         >>> tree, session = t.prepara_albero_ricco(documento_enorme, "test")
         >>> risultato = t.naviga(client, tree, session, domanda, budget_tokens=1500)
     """
-    if client is not None:
-        try:
-            budget = client.working_budget(reserve=0)
-            effective_tetto = max(180, int(budget * 0.02))
-        except Exception:
-            effective_tetto = max(180, int(max_chars * 0.15))
-    else:
-        effective_tetto = max(180, int(max_chars * 0.15))
-
     if tree is None:
         tree = DocTree()
     
+    # Cap derived from the measured profile, never a fixed ceiling.
+    # matrioska_profile prices one index row as 28 + 4 * max_facts tokens,
+    # so the fact part of a row is 4 * max_facts tokens, in calibrated chars.
+    prof = matrioska_profile(client)
+    cpt = max(2.0, float(prof.get('chars_per_token') or 3.2))
+    if tetto_fatti is None:
+        tetto = int(4 * int(prof['max_facts_per_summary']) * cpt)
+    else:
+        tetto = int(tetto_fatti)
+    tetto = max(1, tetto)
+
     # 1. Chunking del documento
     chunks = split_text(documento, name="documento.txt", kind="text", 
                        max_chars=max_chars, max_tokens=10000, min_chars=300, overlap=0)
@@ -1007,28 +1012,18 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
         fatti_nel_chunk.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
         summary_base = meta_etichetta["summary"]
         if fatti_nel_chunk:
-            fact_blocks = []
-            current_block, current_len = [], 0
+            visibili, usati = [], 0
             for f in fatti_nel_chunk:
-                f_str = f if len(f) <= 80 else f[:77] + "..."
-                if current_block and current_len + len(f_str) + 2 > effective_tetto:
-                    fact_blocks.append(", ".join(current_block))
-                    current_block, current_len = [f_str], len(f_str)
-                else:
-                    current_block.append(f_str)
-                    current_len += len(f_str) + 2
-            if current_block:
-                fact_blocks.append(", ".join(current_block))
-            summary_base = "CHIAVE -> " + fact_blocks[0] + (" | " + summary_base if summary_base else "")
-            for idx, block in enumerate(fact_blocks[1:], start=1):
-                child_id = f"{node_id}_facts_{idx}"
-                roots.append(DocNode(
-                    id=child_id,
-                    label=f"Additional facts for Section {i} (block {idx})",
-                    summary="Extracted facts exceeding parent block limit",
-                    text=f"CHIAVE -> {block}",
-                    tokens=len(block) // 4
-                ))
+                f = f if len(f) <= 80 else f[:77] + "..."
+                if visibili and usati + len(f) + 2 > tetto:
+                    break
+                visibili.append(f)
+                usati += len(f) + 2
+            blocco = "CHIAVE -> " + ", ".join(visibili)
+            resto = len(fatti_nel_chunk) - len(visibili)
+            if resto:
+                blocco += " (+%d altri nel ramo)" % resto
+            summary_base = blocco + (" | " + summary_base if summary_base else "")
         
         roots.append(DocNode(
             id=node_id,
@@ -1043,7 +1038,7 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
     if max_children is None:
         if client is not None:
             try:
-                max_children = int(matrioska_profile(client).get("max_children", 8))
+                max_children = int(prof.get("max_children", 8))
             except Exception:
                 max_children = 8
         else:
@@ -1056,14 +1051,14 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
             gruppo = foglie[g:g + max_children]
             inizio = chunks[g].start
             fine = chunks[g + len(gruppo) - 1].end
-            blocco = _fatti_in_range(tutti_i_fatti, inizio, fine, signal_rank, tetto_fatti)
+            blocco = _fatti_in_range(tutti_i_fatti, inizio, fine, signal_rank, tetto)
             if not blocco:
                 # Fallback: eredita i summary delle foglie (termini frequenti, numeri)
                 parti = [c.summary for c in gruppo if c.summary]
                 if parti:
                     blocco = " | ".join(parti)
-                    if len(blocco) > tetto_fatti * 2:
-                        blocco = blocco[:tetto_fatti * 2 - 3] + "..."
+                    if len(blocco) > tetto * 2:
+                        blocco = blocco[:tetto * 2 - 3] + "..."
             roots.append(DocNode(
                 id="macro_%02d" % (g // max_children),
                 label="Macro-blocco %d (sezioni %d-%d)" % (g // max_children, g, g + len(gruppo) - 1),
