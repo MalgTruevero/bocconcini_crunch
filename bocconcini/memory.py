@@ -353,8 +353,28 @@ def _evict(msgs: List[Dict[str, Any]], budget: int, cpt: float, per_msg: float =
             if not kept and question:
                 old = str(msgs[target].get("content") or "")
                 words = {w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9_]{3,}", question)}
-                parts = re.split(r"(?<=[.!?])\s+", old)
-                kept = " ".join(seg.strip() for seg in parts if any(w in seg.lower() for w in words))[:180]
+                # Complete units only: sentence ends or line breaks, never inside
+                # a sentence or a code line, where a cut splits one fact in two.
+                units = [u.strip() for u in re.split(r"(?<=[.!?])\s+|\n", old) if u.strip()]
+                hit = [any(w in u.lower() for w in words) for u in units]
+                skeleton = ("[branch %s evicted from context. Text stays on disk; "
+                            "ask leggi_nodo for %s again]" % (nid, nid))
+                msgs[target]["content"] = skeleton
+                base = cost(msgs) if cost is not None else _msg_tokens(msgs, cpt, per_msg)
+                # Spare capacity from the measured cognitive window, not a fixed
+                # ceiling: a bigger model or a faster machine keeps more context.
+                room = int(max(0, budget - base) * cpt)
+                used = sum(len(u) + 1 for u, h in zip(units, hit) if h)
+                chosen = []
+                for j, (u, h) in enumerate(zip(units, hit)):
+                    if h:
+                        chosen.append(j)
+                    elif used + len(u) + 1 <= room:
+                        chosen.append(j)
+                        used += len(u) + 1
+                # Question-matching units are always kept whole: dropping them
+                # would be a real loss, the forced answer has no tools to recover.
+                kept = " ".join(units[j] for j in chosen)
             keep = (" facts found -> " + kept + ".") if kept else ""
             msgs[target]["content"] = ("[branch %s evicted from context.%s Text stays on disk; "
                                        "ask leggi_nodo for %s again]" % (nid, keep, nid))
@@ -551,7 +571,7 @@ def _parse_text_tool_calls(text: str, tools_available: list) -> list:
 
 def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
            budget_tokens: Optional[int] = None, chars_per_token: float = 3.2,
-           max_hops: Optional[int] = None, max_repeats: int = 2, max_tokens: int = 400,
+           max_hops: Optional[int] = None, max_repeats: int = 2, max_tokens: Optional[int] = None,
            temperature: float = 0.2, require_read: bool = True, max_calls: Optional[int] = None) -> Dict[str, Any]:
     """The model navigates, Python informs and enforces the budget.
 
@@ -562,13 +582,29 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
     """
     budget = int(budget_tokens or client.working_budget(reserve=0))
     cpt = max(1.0, float(chars_per_token))
+    if max_tokens is None:
+        max_tokens = matrioska_profile(client)["answer_tokens"]
     try:
         ovh = float(client._hw().get("msg_overhead") or 8.0)
     except Exception:
         ovh = 8.0
+    try:
+        cog = int(client._cognitive_limit() or 0) or None
+    except Exception:
+        cog = None
     meta: Dict[str, Any] = {"hops": 0, "nodes_read": [], "evicted": 0, "repeats": 0,
                             "branches_cut": [], "unknown_ids": [], "forced_answer": False,
                             "answered_from_index": False, "stopped": "", "budget": budget}
+    # Effective max_tokens: from measured cognitive window, not a fixed ceiling.
+    # Per-turn cap = cog // 8 so a single step never eats the whole context.
+    def _eff_max(prompt_tokens: int, is_final: bool) -> int:
+        if max_tokens is not None:
+            return int(max_tokens)
+        ref = cog if cog else budget
+        margin = int(ovh * 2)
+        residual = ref - int(prompt_tokens) - margin
+        cap = max(200, ref // 8) if not is_final else max(200, ref // 4)
+        return max(200, min(residual, cap))
     roots = tree.index(session).get("nodes") or []
     focus = None
     if len(roots) == 1 and roots[0].get("children"):
@@ -603,11 +639,18 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                 meta["stopped"] = "budget: prompt ~%d > %d (forced answer)" % (pt, budget)
                 meta["forced_answer"] = True
                 try:
-                    meta["evicted"] += _evict(msgs, budget, cpt, ovh, question,
-                                             cost=lambda ms: client._prompt_tokens(ms, None))
-                    r = client.chat_full(messages=msgs, tools=None, temperature=temperature,
-                                        max_tokens=max_tokens, continua=False)
-                    answer = r.text
+                        eff = _eff_max(pt, True)
+                        if cog and pt > int(cog * 0.9):
+                            meta["evicted"] += _evict(msgs, int(cog * 0.7), cpt, ovh, question,
+                                                     cost=lambda ms: client._prompt_tokens(ms, None))
+                        else:
+                            meta["evicted"] += _evict(msgs, budget, cpt, ovh, question,
+                                                     cost=lambda ms: client._prompt_tokens(ms, None))
+                        r = client.chat_full(messages=msgs, tools=None, temperature=temperature,
+                                            max_tokens=eff, continua=False)
+                        if getattr(r, "finish_reason", "") == "length":
+                            meta["truncated"] = meta.get("truncated", 0) + 1
+                        answer = r.text
                 except Exception as exc:
                     meta["stopped"] += "; error: %s" % exc
             else:
@@ -616,17 +659,23 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
         cap = _read_cap(client, msgs, tt, budget, max_tokens if final else 0, max_calls, cpt); meta.setdefault("caps",[]).append(cap)
         if final:
             meta["forced_answer"] = True
-        try:
-            cs = meta.get("_consecutive_searches", 0)
-            if require_read and not meta["nodes_read"] and not final and cs >= 2:
-                tc = {"type": "function", "function": {"name": "leggi_nodo"}}
-            else:
-                tc = "required" if (require_read and not meta["nodes_read"] and not final) else None
-            r = client.chat_full(messages=msgs, tools=tools_now, tool_choice=tc,
-                                 temperature=temperature, max_tokens=max_tokens, continua=False)
-        except Exception as exc:
-            meta["stopped"] = "error: %s" % exc
-            break
+                try:
+                    cs = meta.get("_consecutive_searches", 0)
+                    if require_read and not meta["nodes_read"] and not final and cs >= 2:
+                        tc = {"type": "function", "function": {"name": "leggi_nodo"}}
+                    else:
+                        tc = "required" if (require_read and not meta["nodes_read"] and not final) else None
+                    eff = _eff_max(pt, final)
+                    if cog and pt > int(cog * 0.9):
+                        meta["evicted"] += _evict(msgs, int(cog * 0.7), cpt, ovh, question,
+                                                 cost=lambda ms: client._prompt_tokens(ms, tt))
+                    r = client.chat_full(messages=msgs, tools=tools_now, tool_choice=tc,
+                                        temperature=temperature, max_tokens=eff, continua=False)
+                    if getattr(r, "finish_reason", "") == "length":
+                        meta["truncated"] = meta.get("truncated", 0) + 1
+                except Exception as exc:
+                    meta["stopped"] = "error: %s" % exc
+                break
         if not r.tool_calls:
             # Check if model wrote tool calls as text instead of structured calls
             text_calls = _parse_text_tool_calls(r.text, tools_now or [])
@@ -733,7 +782,7 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                     meta["nodes_read"].append(nid)
                     seen[(nid, o)] = seen.get((nid, o), 0) + 1
                     body = full
-                    nf = ", ".join("%s:%s" % (f["tipo"], f["valore"]) for f in trova_fatti(full))[:180]
+                    nf = ", ".join("%s:%s" % (f["tipo"], f["valore"]) for f in trova_fatti(full))
                     if len(body) > cap:
                         body = full[o:o+cap] + (chr(10)+'[%d/%d chars; next leggi_nodo(id=%s, offset=%d)]' % (o+cap, len(full), nid, o+cap))
                         if o+cap >= len(full): body = full[o:] + (chr(10)+'[end of branch %s: %d chars]' % (nid, len(full)))
@@ -936,7 +985,7 @@ def _fatti_in_range(tutti_i_fatti, start, end, signal_rank, tetto_fatti):
 
 
 def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"] = None, 
-                          max_chars: int = 1500, max_per_tipo: int = 100, tetto_fatti: Optional[int] = None, mode="auto", max_children=None, client=None) -> Tuple["DocTree", str]:
+                          max_chars: int = 1500, max_per_tipo: Optional[int] = None, tetto_fatti: Optional[int] = None, mode="auto", max_children=None, client=None) -> Tuple["DocTree", str]:
     """Costruisce un albero con summary arricchiti dai fatti deterministici.
     
     Chunka il documento, estrae tutti i fatti con trova_fatti(), e per ogni chunk
@@ -948,7 +997,9 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
         sessione: nome della sessione per DocTree
         tree: DocTree esistente (se None, usa ~/.cache/bocconcini/workspace)
         max_chars: dimensione massima dei chunk
-        max_per_tipo: quanti fatti estrarre per tipo (default 100 invece di 40)
+        max_per_tipo: per-type extraction cap. None (default) extracts every
+            fact; a number truncates each type globally, dropping facts that
+            appear late in the document.
         tetto_fatti: max characters of the fact block in each summary. None
             (default) derives it from matrioska_profile(client): the fact part
             of one index row is 4 * max_facts_per_summary tokens, converted with
@@ -1011,20 +1062,36 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
         # Rarest fact types first: 100 hits of a type is noise, 4 hits is signal.
         fatti_nel_chunk.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
         summary_base = meta_etichetta["summary"]
+        extra_leaves = []
         if fatti_nel_chunk:
-            visibili, usati = [], 0
+            # Split into blocks that each fit the derived cap: nothing is dropped,
+            # every overflow block becomes its own leaf after this section.
+            blocks, cur, used = [], [], 0
             for f in fatti_nel_chunk:
                 f = f if len(f) <= 80 else f[:77] + "..."
-                if visibili and usati + len(f) + 2 > tetto:
-                    break
-                visibili.append(f)
-                usati += len(f) + 2
-            blocco = "CHIAVE -> " + ", ".join(visibili)
-            resto = len(fatti_nel_chunk) - len(visibili)
+                if cur and used + len(f) + 2 > tetto:
+                    blocks.append(cur)
+                    cur, used = [f], len(f) + 2
+                else:
+                    cur.append(f)
+                    used += len(f) + 2
+            if cur:
+                blocks.append(cur)
+            block = "CHIAVE -> " + ", ".join(blocks[0])
+            resto = len(fatti_nel_chunk) - len(blocks[0])
             if resto:
-                blocco += " (+%d altri nel ramo)" % resto
-            summary_base = blocco + (" | " + summary_base if summary_base else "")
-        
+                block += " (+%d altri nel ramo)" % resto
+            summary_base = block + (" | " + summary_base if summary_base else "")
+            for n, blk in enumerate(blocks[1:], start=1):
+                body = "CHIAVE -> " + ", ".join(blk)
+                extra_leaves.append(DocNode(
+                    id="%s_facts_%d" % (node_id, n),
+                    label="Facts %d of section %d (pos %d-%d)" % (n, i, ch.start, ch.end),
+                    summary=body,
+                    text=body,
+                    tokens=max(1, int(len(body) / cpt)),
+                ))
+
         roots.append(DocNode(
             id=node_id,
             label=f"Sezione {i} (pos {ch.start}-{ch.end})",
@@ -1032,41 +1099,68 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
             text=ch.text,
             tokens=ch.token_count_estimate()
         ))
-    
+        roots.extend(extra_leaves)
+
     # 4. Salvataggio dell'albero
     # --- Matriosca: raggruppa le foglie in macro-blocchi padre->figli ---
     if max_children is None:
-        if client is not None:
-            try:
-                max_children = int(prof.get("max_children", 8))
-            except Exception:
-                max_children = 8
-        else:
-            max_children = 8
+        max_children = int(prof.get("max_children", 8))
     max_children = max(2, int(max_children))
-    if mode in ("matriosca", "auto") and len(roots) > max_children:
-        foglie = roots
-        roots = []
-        for g in range(0, len(foglie), max_children):
-            gruppo = foglie[g:g + max_children]
-            inizio = chunks[g].start
-            fine = chunks[g + len(gruppo) - 1].end
-            blocco = _fatti_in_range(tutti_i_fatti, inizio, fine, signal_rank, tetto)
-            if not blocco:
-                # Fallback: eredita i summary delle foglie (termini frequenti, numeri)
-                parti = [c.summary for c in gruppo if c.summary]
-                if parti:
-                    blocco = " | ".join(parti)
-                    if len(blocco) > tetto * 2:
-                        blocco = blocco[:tetto * 2 - 3] + "..."
-            roots.append(DocNode(
-                id="macro_%02d" % (g // max_children),
-                label="Macro-blocco %d (sezioni %d-%d)" % (g // max_children, g, g + len(gruppo) - 1),
-                summary=blocco,
-                text="",
-                tokens=sum(c.tokens for c in gruppo),
-                children=gruppo,
-            ))
+    if mode in ("matriosca", "auto"):
+        level = 0
+        while len(roots) > max_children:
+            level += 1
+            parents = []
+            for g in range(0, len(roots), max_children):
+                gruppo = roots[g:g + max_children]
+                # Facts come from the children summaries, never from positional
+                # chunk indices: extra fact leaves must not shift the spans.
+                seen = []
+                for c in gruppo:
+                    if "CHIAVE -> " in (c.summary or ""):
+                        blk = c.summary.split("CHIAVE -> ", 1)[1].split(" | ", 1)[0]
+                        blk = blk.split(" (+", 1)[0]
+                        for v in blk.split(","):
+                            v = v.strip()
+                            if v and v not in seen:
+                                seen.append(v)
+                seen.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
+                block = ""
+                if seen:
+                    shown, used = [], 0
+                    for v in seen:
+                        if shown and used + len(v) + 2 > tetto:
+                            break
+                        shown.append(v)
+                        used += len(v) + 2
+                    block = "CHIAVE -> " + ", ".join(shown)
+                    if len(seen) > len(shown):
+                        block += " (+%d altri nel ramo)" % (len(seen) - len(shown))
+                if not block:
+                    parts = [c.summary for c in gruppo if c.summary]
+                    if parts:
+                        block = " | ".join(parts)
+                        if len(block) > tetto * 2:
+                            block = block[:tetto * 2 - 3] + "..."
+                ordinals = [int(c.id[4:7]) for c in gruppo
+                            if c.id.startswith("sec_") and c.id[4:7].isdigit()]
+                if ordinals:
+                    span_label = "sezioni %d-%d" % (min(ordinals), max(ordinals))
+                else:
+                    span_label = "%s ... %s" % (gruppo[0].label.split("(")[0].strip(),
+                                        gruppo[-1].label.split("(")[0].strip())
+                nid = "macro_%02d" % (g // max_children)
+                if level > 1:
+                    nid = "macro_l%d_%02d" % (level, g // max_children)
+                parents.append(DocNode(
+                    id=nid,
+                    label="Macro-block %d (%s)" % (g // max_children, span_label),
+                    summary=block,
+                    text="",
+                    tokens=sum(c.tokens for c in gruppo),
+                    children=gruppo,
+                ))
+            roots = parents
     tree.save(sessione, roots)
     
     return tree, sessione

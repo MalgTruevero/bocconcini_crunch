@@ -1,3 +1,35 @@
+=== bocconcini/__init__.py ===
+"""bocconcini - Local LLM client for small usable windows."""
+
+from .client import (
+    LlamaCppClient, OpenAICompatClient, ChatReply, ModelError, Chunk,
+    split_text, iter_chunks, detect_kind, estimate_tokens,
+    LlamaServerTokenizer, split_thinking, parse_tool_calls_from_text,
+    extract_local, ask_stepwise, get_model_info,
+)
+from .memory import (
+    DocNode, DocTree, TreeError, etichetta, naviga, albero_codice,
+    trova_fatti, prepara_albero_ricco, matrioska_profile, prepare_matrioska_tree, calibra_navigazione,
+)
+from .rami import Spill, spill_messaggi
+
+__all__ = [
+    "LlamaCppClient", "OpenAICompatClient", "ChatReply", "ModelError",
+    "Chunk", "split_text", "iter_chunks", "detect_kind", "estimate_tokens",
+    "LlamaServerTokenizer", "split_thinking", "parse_tool_calls_from_text",
+    "extract_local", "ask_stepwise", "get_model_info",
+    "DocNode", "DocTree", "TreeError", "etichetta", "naviga", "albero_codice",
+    "trova_fatti", "prepara_albero_ricco", "matrioska_profile", "prepare_matrioska_tree", "calibra_navigazione",
+    "Spill", "spill_messaggi",
+]
+
+from . import client, docs
+from .client import *
+from .client import __version__
+__all__ = sorted(set(__all__) | set(client.__all__) | {"docs", "__version__"})
+
+
+=== bocconcini/client.py ===
 """bocconcini 5.0 - split text/Python/JSON into LLM-sized chunks and talk to a
 local llama.cpp / KoboldCpp / Ollama / OpenAI-compatible server.
 
@@ -1109,7 +1141,71 @@ TokenCounter = LlamaServerTokenizer   # name used by 3.24
 # ----------------------------------------------------------------------------
 # One job at a time per server (re-entrant) + busy notifications
 # ----------------------------------------------------------------------------
-_GATES: Dict[str, "threading.RLock"] = {}
+class _ReentrantSemaphore:
+    """Semaphore with capacity N, but re-entrant for the same thread (no deadlock on nested calls)."""
+    def __init__(self, capacity: int):
+        self._sem = threading.Semaphore(max(1, capacity))
+        self._local = threading.local()
+    def acquire(self, timeout: Optional[float] = None) -> bool:
+        count = getattr(self._local, "count", 0)
+        if count > 0:
+            self._local.count = count + 1
+            return True
+        if not self._sem.acquire(timeout=timeout if timeout is not None else -1):
+            return False
+        self._local.count = 1
+        return True
+    def release(self) -> None:
+        count = getattr(self._local, "count", 0)
+        if count <= 1:
+            self._local.count = 0
+            self._sem.release()
+        else:
+            self._local.count = count - 1
+
+def _probe_parallelism(base_url: str) -> int:
+    """HTTP probe to /slots to measure server parallel capacity. Returns 1 on failure."""
+    try:
+        import urllib.request, json
+        url = base_url.rstrip("/") + "/slots"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=2) as r:
+            data = json.loads(r.read())
+            return len(data) if isinstance(data, list) else 1
+    except Exception:
+        return 1
+
+def _load_parallel_cache(base_url: str) -> Optional[int]:
+    """Load cached parallel capacity from hardware_profile.json."""
+    try:
+        from pathlib import Path
+        cache_file = Path.home() / ".cache" / "bocconcini" / "parallel_cache.json"
+        if cache_file.exists():
+            import json
+            data = json.loads(cache_file.read_text())
+            key = base_url.rstrip("/").lower()
+            return data.get(key + "_parallel")
+    except Exception:
+        pass
+    return None
+
+def _save_parallel_cache(base_url: str, capacity: int) -> None:
+    """Save parallel capacity to parallel_cache.json."""
+    try:
+        from pathlib import Path
+        import json, os, threading
+        cache_file = Path.home() / ".cache" / "bocconcini" / "parallel_cache.json"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        data = json.loads(cache_file.read_text()) if cache_file.exists() else {}
+        key = base_url.rstrip("/").lower()
+        data[key + "_parallel"] = capacity
+        tmp = cache_file.with_name(cache_file.name + ".tmp.%d.%d" % (os.getpid(), threading.get_ident()))
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(str(tmp), str(cache_file))
+    except Exception:
+        pass
+
+_GATES: Dict[str, _ReentrantSemaphore] = {}
 _GATE_DEPTH: Dict[str, int] = {}
 _GATE_MUTEX = threading.Lock()
 _BUSY_SINCE: Dict[str, float] = {}
@@ -1171,7 +1267,13 @@ def lavoro_atomico(base_url: str = "", blocca_altri: bool = True, timeout_attesa
         return
     key = _lock_key(base_url)
     with _GATE_MUTEX:
-        lk = _GATES.setdefault(key, threading.RLock())
+        cached = _load_parallel_cache(base_url)
+    if cached is None:
+        cached = _probe_parallelism(base_url)
+        with _GATE_MUTEX:
+            _save_parallel_cache(base_url, cached)
+    with _GATE_MUTEX:
+        lk = _GATES.setdefault(key, _ReentrantSemaphore(cached))
     if not lk.acquire(timeout=-1 if timeout_attesa is None else float(timeout_attesa)):
         raise ModelError("another job is still running on %s" % key, kind="busy")
     with _GATE_MUTEX:
@@ -1676,6 +1778,13 @@ class LlamaCppClient:
             log.warning("ignored arguments: %s", ", ".join(sorted(_ignored)))
         if api_key and self.base_url.startswith("http://") and not _is_local(self.base_url):
             raise ValueError("refusing to send an api_key over plain http to a remote host")
+        if not model:
+            try:
+                detected = get_model_info(self.base_url).get("model", "")
+                if detected and detected != "unknown":
+                    model = detected
+            except Exception:
+                pass
         self.model, self.timeout, self.api_key = model, timeout, api_key
         self.temperature_provider = temperature_provider
         self.n_ctx, self.auto_reduce, self.auto_max_tokens = n_ctx, auto_reduce, auto_max_tokens
@@ -2609,8 +2718,9 @@ class LlamaCppClient:
             return msgs
         from .rami import Spill, spill_messaggi
         if self._store is None:
-            import tempfile
-            self._store = Spill(self.spill_dir or tempfile.mkdtemp(prefix="bocconcini_"))
+            default_spill = self.spill_dir or os.path.expanduser("~/.cache/bocconcini/spill")
+            os.makedirs(default_spill, exist_ok=True)
+            self._store = Spill(default_spill)
         out = spill_messaggi(msgs, self._store, soglia_caratteri=max(200, int(budget * 0.32)))
         rami = [m["ramo"] for m in out if m.get("ramo")]
         if rami:
@@ -2824,13 +2934,36 @@ class OpenAICompatClient(LlamaCppClient):
 _DEFAULT_CLIENT: List[Optional[LlamaCppClient]] = [None]
 _DEFAULT_CLIENT_LOCK = threading.Lock()
 
+_DEFAULT_CLIENT_CONFIG: Optional[Dict[str, Any]] = None
+_DEFAULT_CLIENT_CONFIG_LOCK = threading.Lock()
+
+
+def _load_default_client_config() -> Dict[str, Any]:
+    """Load default client settings from ~/.config/bocconcini/config.json (read once, cached)."""
+    global _DEFAULT_CLIENT_CONFIG
+    with _DEFAULT_CLIENT_CONFIG_LOCK:
+        if _DEFAULT_CLIENT_CONFIG is None:
+            _DEFAULT_CLIENT_CONFIG = {}
+            try:
+                from pathlib import Path
+                cfg_file = Path.home() / ".config" / "bocconcini" / "config.json"
+                if cfg_file.exists():
+                    import json
+                    loaded = json.loads(cfg_file.read_text())
+                    if isinstance(loaded, dict):
+                        _DEFAULT_CLIENT_CONFIG = loaded
+            except Exception as exc:
+                log.warning("cannot read bocconcini config: %s", exc)
+        return _DEFAULT_CLIENT_CONFIG
+
+
 
 def ask(prompt: str, system: str = "", temperature: float = 0.7, **options: Any) -> str:
     cl = options.pop("client", None)
     if cl is None:
         with _DEFAULT_CLIENT_LOCK:
             if _DEFAULT_CLIENT[0] is None:
-                _DEFAULT_CLIENT[0] = LlamaCppClient()
+                _DEFAULT_CLIENT[0] = LlamaCppClient(**_load_default_client_config())
             cl = _DEFAULT_CLIENT[0]
     return cl.chat(prompt, system, temperature, **options)
 
@@ -2939,3 +3072,2180 @@ from .memory import (
     ask_stepwise, DocTree, DocNode, TreeError,
     trova_fatti, prepara_albero_ricco, calibra_navigazione
 )
+
+
+=== bocconcini/docs.py ===
+"""bocconcini.docs - read long documents (PDF text, books, mixed prose + code) with a small model.
+
+Standard library only (+ the optional ``pdftotext`` binary for PDFs). Companion of ``bocconcini``.
+
+The idea, in three rules
+  * TEXT   -> summarised with Refine: old notes + new piece -> new notes (the model writes them).
+  * CODE   -> NEVER summarised by the model. We keep a deterministic outline (``ast`` for Python,
+              verbatim declaration lines for other languages) and the most recent pieces verbatim.
+  * BUDGET -> the final prompt is built to fit a token budget: oldest verbatim code goes first,
+              then oldest outlines, then the notes are cut at a sentence end. The question is never cut.
+
+Quick start::
+
+    from bocconcini import LlamaCppClient
+    from bocconcini.docs import analyze, read_pdf_pages
+
+    client = LlamaCppClient("http://127.0.0.1:8082")
+    pages = read_pdf_pages("manual.pdf")              # needs: pkg install poppler
+    reply = analyze(client, pages, "What does the install section require?")
+    print(reply.text)
+
+Italian names of the first prototype (``classifica_blocco``, ``dividi_misto``,
+``estrai_logica_codice``, ``processa_misto``) are kept as thin wrappers.
+"""
+from __future__ import annotations
+
+import ast
+import hashlib
+import logging
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+
+from .client import ChatReply, ModelError, estimate_tokens, iter_chunks, split_text, LlamaServerTokenizer
+
+__version__ = "1.0.0"
+__all__ = ["Block", "classify_block", "split_mixed", "code_outline", "Digest", "process_document",
+           "analyze", "read_pdf_pages", "classifica_blocco", "dividi_misto", "estrai_logica_codice",
+           "processa_misto"]
+
+log = logging.getLogger("bocconcini.docs")
+Ask = Callable[[str], str]
+
+
+@dataclass
+class Block:
+    kind: str                 # "text" | "code"
+    text: str
+    lang: str = ""            # language hint from a fence, if any
+    fenced: bool = False
+
+
+# ----------------------------------------------------------------------------
+# Classification: code or text? Pure Python, the model is never asked.
+# ----------------------------------------------------------------------------
+_PY_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom, ast.Assign,
+             ast.AnnAssign, ast.AugAssign, ast.Return, ast.If, ast.For, ast.AsyncFor, ast.While, ast.With,
+             ast.AsyncWith, ast.Try, ast.Raise, ast.Assert, ast.Delete, ast.Global, ast.Nonlocal)
+
+_CODE_LINE = [re.compile(p) for p in (
+    r"^\s*(async\s+)?(def|class)\s+\w+.*:\s*(#.*)?$",
+    r"^\s*(if|elif|while|for|with|except|try|else|finally)\b[^.!?]*:\s*(#.*)?$",
+    r"^\s*(import\s+[\w.]+(\s+as\s+\w+)?(\s*,\s*[\w.]+)*|from\s+[\w.]+\s+import\s+.+)\s*$",
+    r"^\s*(return|raise|yield)\b[^.!?]*[(\[=]",
+    r"^\s*return(\s+\S+)?\s*$",
+    r"^\s*[A-Za-z_][\w.\[\]'\"]*\s*(=|\+=|-=|\*=|/=|:=)(?!=)\s*\S",
+    r"^\s*[A-Za-z_][\w.]*\([^)]*\)\s*;?\s*$",
+    r"^\s*@\w[\w.]*(\(.*\))?\s*$",
+    r"[;{}]\s*$",
+    r"^\s*#(include|define|ifdef|ifndef|endif)\b",
+    r"=>|::\w|->\s*\w+\s*\{",
+    r"^\s*\$\s+\S",
+    r"^\s*(function|const|let|var|public|private|protected|static|fn|func|package|namespace)\s+\S+.*[({=]",
+    r"^\s*</?[A-Za-z][\w-]*(\s[^>]*)?/?>\s*$",
+)]
+_WORD = re.compile(r"[^\W\d_]{2,}", re.U)
+
+
+def _line_score(line: str) -> int:
+    """+1 looks like code, -1 looks like prose, 0 unknown (blank, comment, short)."""
+    s = line.rstrip()
+    st = s.strip()
+    if not st:
+        return 0
+    for rx in _CODE_LINE:
+        if rx.search(s):
+            return 1
+    if re.match(r"^\s{4,}|^\t", s) and re.search(r"[=()\[\]{}:;]", st):
+        return 1
+    if re.match(r"^#{1,6}\s+\S", st) or re.match(r"^([-*+]|\d+[.)])\s+\S", st):
+        return -1
+    words = _WORD.findall(st)
+    if len(words) >= 6 and not re.search(r"[=;{}]|\w\(", st):
+        return -1
+    return 0
+
+
+def _python_evidence(text: str) -> bool:
+    """True when ``text`` parses as Python AND contains something that is not just a bare word."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    for node in tree.body:
+        if isinstance(node, _PY_NODES):
+            return True
+        if isinstance(node, ast.Expr) and isinstance(node.value, (ast.Call, ast.Await, ast.Yield, ast.YieldFrom)):
+            if re.match(r"^\s*[\w.]+\(", text):          # 'print(x)' yes, 'Nota (1)' no
+                return True
+    return False
+
+
+def classify_block(text: str) -> str:
+    """Return "code" or "text".
+
+    A bare word, a number or a comma list ("mele, pere") is valid Python but is prose: ast.parse
+    alone is NOT enough, the tree must contain real statements.
+    """
+    t = (text or "").strip()
+    if not t:
+        return "text"
+    if _python_evidence(t):
+        return "code"
+    lines = [ln for ln in t.splitlines() if ln.strip()]
+    votes = [_line_score(ln) for ln in lines]
+    code, prose = sum(1 for v in votes if v > 0), sum(1 for v in votes if v < 0)
+    if code == 0:
+        return "text"
+    if code >= 2 and code >= prose:
+        return "code"
+    return "code" if code / len(lines) >= 0.4 and code > prose else "text"
+
+
+# ----------------------------------------------------------------------------
+# Splitting mixed text into blocks
+# ----------------------------------------------------------------------------
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)[^`]*$")
+
+
+def _scan_fences(text: str) -> List[Tuple[str, str, str, bool]]:
+    """Split into ("outside", "", text, True) and ("fence", lang, body, closed) parts. Line based:
+    handles CRLF, ~~~ fences, longer fences and a fence that is never closed (cut chunk)."""
+    out: List[Tuple[str, str, str, bool]] = []
+    buf: List[str] = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        m = _FENCE_OPEN.match(lines[i])
+        if not m:
+            buf.append(lines[i])
+            i += 1
+            continue
+        if buf:
+            out.append(("outside", "", "\n".join(buf), True))
+            buf = []
+        mark, lang = m.group(1), m.group(2)
+        close = re.compile(r"^ {0,3}%s{%d,}\s*$" % (re.escape(mark[0]), len(mark)))
+        j, body, closed = i + 1, [], False
+        while j < len(lines):
+            if close.match(lines[j]):
+                closed = True
+                break
+            body.append(lines[j])
+            j += 1
+        out.append(("fence", lang, "\n".join(body), closed))
+        i = j + 1
+    if buf:
+        out.append(("outside", "", "\n".join(buf), True))
+    return out
+
+
+_CONTINUES = re.compile(r"^(\s+\S|[)\]}]|(else|elif|except|finally)\b|@|def |class |async def )")
+
+
+def _segment_outside(text: str) -> List[Block]:
+    """Outside fences: paragraphs are classified one by one, then repaired.
+
+    A blank line inside a Python function must not turn the rest of the function into prose:
+    a paragraph that follows code and still looks indented/continuing stays code.
+    """
+    paras = [p for p in re.split(r"\n[ \t]*\n", text) if p.strip()]
+    kinds = [classify_block(p) for p in paras]
+    for i, p in enumerate(paras):
+        if kinds[i] != "text" or i == 0:
+            continue
+        first = p.split("\n", 1)[0]
+        prose = sum(1 for ln in p.splitlines() if _line_score(ln) < 0)
+        if kinds[i - 1] == "code" and _CONTINUES.match(first) and prose == 0:
+            kinds[i] = "code"
+        elif (kinds[i - 1] == "code" and i + 1 < len(paras) and classify_block(paras[i + 1]) == "code"
+              and prose == 0 and len(p.splitlines()) <= 3):
+            kinds[i] = "code"
+    return [Block(k, p.strip("\n")) for k, p in zip(kinds, paras)]
+
+
+def split_mixed(text: str) -> List[Block]:
+    """Cut text into [Block("text"|"code", ...)]. Fences are certain; the rest is classified."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    blocks: List[Block] = []
+    for kind, lang, body, _closed in _scan_fences(text):
+        if kind == "fence":
+            if body.strip():
+                blocks.append(Block("code", body.strip("\n"), lang.lower(), True))
+        else:
+            blocks.extend(_segment_outside(body))
+    merged: List[Block] = []
+    for b in blocks:                      # fewer, bigger blocks of the same kind
+        if merged and merged[-1].kind == b.kind and merged[-1].lang == b.lang:
+            merged[-1] = Block(b.kind, merged[-1].text + "\n\n" + b.text, b.lang, merged[-1].fenced and b.fenced)
+        else:
+            merged.append(b)
+    return merged
+
+
+# ----------------------------------------------------------------------------
+# Code outline: deterministic, never invented
+# ----------------------------------------------------------------------------
+def _unparse(node: Optional[ast.AST]) -> str:
+    if node is None:
+        return ""
+    fn = getattr(ast, "unparse", None)
+    if fn is None:
+        return ""
+    try:
+        return fn(node)
+    except Exception:
+        return ""
+
+
+def _signature(fn: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> str:
+    a = fn.args
+    pos = list(getattr(a, "posonlyargs", [])) + list(a.args)
+    defaults = [None] * (len(pos) - len(a.defaults)) + list(a.defaults)
+    parts: List[str] = []
+    for arg, dflt in zip(pos, defaults):
+        s = arg.arg + (": " + _unparse(arg.annotation) if arg.annotation is not None else "")
+        if dflt is not None:
+            v = _unparse(dflt) or "..."
+            s += "=" + (v if len(v) <= 20 else "...")
+        parts.append(s)
+    if a.vararg:
+        parts.append("*" + a.vararg.arg)
+    elif a.kwonlyargs:
+        parts.append("*")
+    for arg, dflt in zip(a.kwonlyargs, a.kw_defaults):
+        s = arg.arg + (": " + _unparse(arg.annotation) if arg.annotation is not None else "")
+        if dflt is not None:
+            v = _unparse(dflt) or "..."
+            s += "=" + (v if len(v) <= 20 else "...")
+        parts.append(s)
+    if a.kwarg:
+        parts.append("**" + a.kwarg.arg)
+    ret = _unparse(fn.returns)
+    return "(%s)%s" % (", ".join(parts), " -> " + ret if ret else "")
+
+
+def _calls(fn: ast.AST) -> List[str]:
+    names = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Name):
+                names.add(n.func.id)
+            elif isinstance(n.func, ast.Attribute):
+                names.add(n.func.attr)
+    return sorted(names)[:12]
+
+
+def _doc1(node: ast.AST) -> str:
+    d = ast.get_docstring(node)  # type: ignore[arg-type]
+    return d.strip().splitlines()[0][:100] if d else ""
+
+
+def _def_line(fn: Union[ast.FunctionDef, ast.AsyncFunctionDef], indent: str) -> str:
+    end = getattr(fn, "end_lineno", fn.lineno)
+    deco = " ".join("@" + (_unparse(d).split("(")[0] or "?") for d in fn.decorator_list)
+    calls = _calls(fn)
+    line = "%s%sdef %s%s  L%d-%d" % (indent, "async " if isinstance(fn, ast.AsyncFunctionDef) else "",
+                                      fn.name, _signature(fn), fn.lineno, end)
+    if deco:
+        line += "  [%s]" % deco
+    if calls:
+        line += "  calls: " + ", ".join(calls)
+    d = _doc1(fn)
+    return line + ("\n%s    doc: %s" % (indent, d) if d else "")
+
+
+def _py_parse_prefix(code: str) -> Tuple[Optional[ast.Module], int]:
+    """Parse ``code``; if a chunk boundary cut it, drop trailing lines until it parses."""
+    lines = code.split("\n")
+    for drop in (0, 1, 2, 3, 5, 8, 13, 21, 34):
+        if drop >= len(lines):
+            break
+        try:
+            return ast.parse("\n".join(lines[:len(lines) - drop])), drop
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            continue
+    return None, 0
+
+
+def _py_outline(code: str) -> Optional[str]:
+    tree, dropped = _py_parse_prefix(code)
+    if tree is None:
+        return None
+    n = len(code.split("\n"))
+    out = ["python, %d lines%s" % (n, " (last %d lines cut mid-statement, not shown)" % dropped if dropped else "")]
+    imports: List[str] = []
+    consts: List[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imports += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            imports.append("%s%s" % ("." * node.level, node.module or "") + " (" + ", ".join(a.name for a in node.names[:6]) + ")")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            consts += [t.id for t in targets if isinstance(t, ast.Name)]
+    if imports:
+        out.append("imports: " + ", ".join(imports[:14]) + (" ..." if len(imports) > 14 else ""))
+    if consts:
+        out.append("module names: " + ", ".join(consts[:15]) + (" ..." if len(consts) > 15 else ""))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.append(_def_line(node, ""))
+        elif isinstance(node, ast.ClassDef):
+            bases = ", ".join(_unparse(b) for b in node.bases)
+            out.append("class %s%s  L%d-%d" % (node.name, "(%s)" % bases if bases else "", node.lineno,
+                                               getattr(node, "end_lineno", node.lineno)))
+            d = _doc1(node)
+            if d:
+                out.append("    doc: " + d)
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out.append(_def_line(sub, "  "))
+    if len(out) == 1:
+        out.append("no functions or classes")
+    return "\n".join(out)
+
+
+_GENERIC = [re.compile(p) for p in (
+    r"^\s*(export\s+)?(default\s+)?(async\s+)?function\b.*",
+    r"^\s*(export\s+)?(abstract\s+)?(class|interface|enum|struct|trait|impl|module|namespace)\s+\w+.*",
+    r"^\s*(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s*)?(\([^)]*\)|\w+)\s*=>.*",
+    r"^\s*(pub\s+)?(async\s+)?fn\s+\w+.*",
+    r"^\s*func\s+(\(.*?\)\s*)?\w+\(.*",
+    r"^\s*(async\s+)?def\s+\w+.*",
+    r"^\s*(public|private|protected|static|final|virtual|override|inline)\b.*\(.*\).*",
+    r"^\s*#include\s+.*",
+    r"^\s*(import|using|require|use|package)\b.*",
+    r"^\s*(?!if\b|for\b|while\b|switch\b|return\b|else\b)\w[\w\s*&:<>,]*\s+\w+\s*\([^;]*\)\s*\{?\s*$",
+)]
+
+
+def _generic_outline(code: str, lang: str = "") -> str:
+    lines = code.split("\n")
+    hits = []
+    for n, ln in enumerate(lines, 1):
+        if any(rx.match(ln) for rx in _GENERIC):
+            hits.append("L%d: %s" % (n, ln.strip()[:140]))
+    head = "%s, %d lines, declaration lines (verbatim)" % (lang or "code", len(lines))
+    if not hits:
+        return head + ": none recognised"
+    more = "\n... %d more" % (len(hits) - 60) if len(hits) > 60 else ""
+    return head + "\n" + "\n".join(hits[:60]) + more
+
+
+def code_outline(code: str, lang: str = "") -> str:
+    """Structure of ``code`` without any model: ast for Python, declaration lines otherwise."""
+    if lang in ("", "python", "py", "python3") and (lang or classify_block(code) == "code"):
+        out = _py_outline(code)
+        if out is not None:
+            return out
+    return _generic_outline(code, lang)
+
+
+# ----------------------------------------------------------------------------
+# Digest: rolling notes for text, outline + recent verbatim for code
+# ----------------------------------------------------------------------------
+_L10N = {
+    "en": {
+        "refine": ("Update the notes with the new text. Keep facts, names, numbers and decisions. Do not "
+                   "invent anything. At most {chars} characters. Reply with the updated notes only.\n\n"
+                   "NOTES SO FAR:\n{notes}\n\nNEW TEXT:\n{piece}\n\nUPDATED NOTES:"),
+        "map": ("Summarise the text below. Keep facts, names, numbers and decisions. Do not invent "
+                "anything. At most {chars} characters.\n\nTEXT:\n{piece}\n\nSUMMARY:"),
+        "merge": ("Merge these notes into one. Keep every fact, drop repetitions. At most {chars} "
+                  "characters.\n\n{notes}\n\nMERGED NOTES:"),
+        "h_notes": "[TEXT - NOTES WRITTEN BY THE MODEL]", "h_map": "[CODE - STRUCTURE EXTRACTED WITH AST, NOT SUMMARISED]",
+        "h_code": "[CODE - RECENT PIECES, VERBATIM]", "h_q": "[QUESTION]",
+        "none_t": "(no text)", "none_c": "(no code)", "omitted": "(%d earlier outline(s) omitted)",
+    },
+    "it": {
+        "refine": ("Migliora gli appunti con il testo nuovo. Tieni fatti, nomi, numeri e decisioni. Non "
+                   "inventare niente. Massimo {chars} caratteri. Rispondi solo con gli appunti aggiornati.\n\n"
+                   "APPUNTI FINORA:\n{notes}\n\nTESTO NUOVO:\n{piece}\n\nAPPUNTI AGGIORNATI:"),
+        "map": ("Riassumi il testo qui sotto. Tieni fatti, nomi, numeri e decisioni. Non inventare niente. "
+                "Massimo {chars} caratteri.\n\nTESTO:\n{piece}\n\nRIASSUNTO:"),
+        "merge": ("Unisci questi appunti in uno solo. Tieni ogni fatto, togli le ripetizioni. Massimo {chars} "
+                  "caratteri.\n\n{notes}\n\nAPPUNTI UNITI:"),
+        "h_notes": "[TESTO - APPUNTI SCRITTI DAL MODELLO]", "h_map": "[CODICE - STRUTTURA ESTRATTA CON AST, NON RIASSUNTA]",
+        "h_code": "[CODICE - PEZZI RECENTI, VERBATIM]", "h_q": "[DOMANDA]",
+        "none_t": "(nessun testo)", "none_c": "(nessun codice)", "omitted": "(%d outline precedenti omesse)",
+    },
+}
+
+
+def _cut_sentence(text: str, max_chars: int) -> str:
+    """Cut at a sentence/line end instead of in the middle of a fact."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    k = max(cut.rfind(". "), cut.rfind("\n"), cut.rfind("; "))
+    return (cut[:k + 1] if k > max_chars * 0.5 else cut).rstrip()
+
+
+class Digest:
+    """Incrementally digest a long document so that a small model can answer about it.
+
+    ``ask(prompt) -> str`` talks to the model (e.g. ``client.chat``). Code is never sent to it.
+    ``mode="refine"``: one rolling set of notes. ``mode="map"``: one note per piece, merged pairwise
+    when they exceed their budget (keeps early details better on very long documents).
+    """
+    def __init__(self, ask: Ask, *, budget_tokens: int = 2000, mode: str = "refine", lang: str = "en",
+                 summary_tokens: Optional[int] = None, summary_chars: Optional[int] = None,
+                 code_verbatim_tokens: Optional[int] = None, piece_tokens: Optional[int] = None, chars_per_token: Optional[float] = None) -> None:
+        if mode not in ("refine", "map"):
+            raise ValueError("mode must be 'refine' or 'map'")
+        self.ask, self.mode = ask, mode
+        self.t = _L10N.get(lang, _L10N["en"])
+        self.budget = max(300, int(budget_tokens))
+        self.summary_tokens = summary_tokens or int(self.budget * 0.35)
+        self.cpt = max(1.0, min(8.0, float(chars_per_token or 3.2)))
+        self.summary_chars = summary_chars or int(self.summary_tokens * self.cpt)
+        self.code_verbatim_tokens = code_verbatim_tokens or int(self.budget * 0.40)
+        self.piece_tokens = piece_tokens or max(150, self.budget - self.summary_tokens - 250)
+        self.summary = ""
+        self.notes: List[str] = []
+        self.outlines: List[str] = []
+        self._seen: set = set()
+        self.recent: List[Block] = []
+        self.stats: Dict[str, int] = {"text_blocks": 0, "code_blocks": 0, "model_calls": 0, "model_failures": 0,
+                                      "notes_cut": 0, "pieces_lost": 0}
+
+    # -- feeding -------------------------------------------------------------
+    def feed(self, piece: str) -> None:
+        for blk in split_mixed(piece):
+            (self._feed_code if blk.kind == "code" else self._feed_text)(blk)
+
+    def _ask(self, prompt: str) -> Optional[str]:
+        self.stats["model_calls"] += 1
+        try:
+            out = (self.ask(prompt) or "").strip()
+        except ModelError as exc:
+            log.warning("model call failed (%s): keeping the previous notes", exc)
+            self.stats["model_failures"] += 1
+            return None
+        return out or None
+
+    def _feed_text(self, blk: Block) -> None:
+        self.stats["text_blocks"] += 1
+        for p in split_text(blk.text, "text", max_tokens=self.piece_tokens,
+                            max_chars=int(self.piece_tokens * self.cpt), min_chars=100, overlap=0):
+            if self.mode == "refine":
+                out = self._ask(self.t["refine"].format(chars=self.summary_chars, notes=self.summary or "-",
+                                                        piece=p.text))
+                if out:
+                    if len(out) > self.summary_chars:
+                        self.stats["notes_cut"] += 1
+                    self.summary = _cut_sentence(out, self.summary_chars)
+                else:
+                    self.stats["pieces_lost"] += 1
+            else:
+                per = max(200, self.summary_chars // 4)
+                out = self._ask(self.t["map"].format(chars=per, piece=p.text))
+                if out:
+                    self.notes.append(_cut_sentence(out, per))
+                    self._compact()
+                else:
+                    self.stats["pieces_lost"] += 1
+
+    def _compact(self) -> None:
+        while len(self.notes) > 1 and estimate_tokens("\n".join(self.notes)) > self.summary_tokens:
+            half = max(2, len(self.notes) // 2)
+            merged: List[str] = []
+            for i in range(0, len(self.notes), 2):
+                pair = self.notes[i:i + 2]
+                if len(pair) == 1:
+                    merged.append(pair[0])
+                    continue
+                per = max(200, int(self.summary_chars / max(1, half)))
+                out = self._ask(self.t["merge"].format(chars=per, notes="\n---\n".join(pair)))
+                if out:
+                    merged.append(_cut_sentence(out, per))
+                else:
+                    merged.append(_cut_sentence("\n".join(pair), per))
+                    self.stats["notes_cut_merge"] = self.stats.get("notes_cut_merge", 0) + 1
+            if len(merged) >= len(self.notes):
+                break
+            self.notes = merged
+
+    def _feed_code(self, blk: Block) -> None:
+        self.stats["code_blocks"] += 1
+        is_py = blk.lang in ("", "python", "py", "python3") and _python_evidence(blk.text)
+        pieces = [blk.text]
+        if estimate_tokens(blk.text, "python") > self.piece_tokens:
+            pieces = [c.text for c in iter_chunks(blk.text, "x.py" if is_py else "x.txt",
+                                                  max_tokens=self.piece_tokens,
+                                                  max_chars=int(self.piece_tokens * 2.8), min_chars=100, overlap=0)]
+        for body in pieces:
+            key = hashlib.blake2b(body.encode("utf-8", "replace"), digest_size=8).hexdigest()
+            if key in self._seen:
+                continue
+            self._seen.add(key)
+            self.outlines.append(code_outline(body, blk.lang))
+            self.recent.append(Block("code", body, blk.lang, blk.fenced))
+            while len(self.recent) > 1 and sum(estimate_tokens(b.text, "python") for b in self.recent) \
+                    > self.code_verbatim_tokens:
+                self.recent.pop(0)                    # the outline stays, only the verbatim copy goes
+
+    # -- reading -------------------------------------------------------------
+    @property
+    def text_notes(self) -> str:
+        return self.summary if self.mode == "refine" else "\n".join(self.notes)
+
+    @property
+    def code_map(self) -> str:
+        return "\n\n".join(self.outlines)
+
+    def prompt(self, question: str = "", budget_tokens: Optional[int] = None) -> str:
+        """Final prompt, fitted to the budget. The question is never cut."""
+        budget = int(budget_tokens or self.budget)
+        t = self.t
+        def ntok(txt: str) -> int:
+            return int(len(txt) / self.cpt) + 1
+
+        def render(notes: str, omitted: int, outlines: List[str], recent: List[Block]) -> str:
+            mp = ("\n\n".join(outlines) if outlines else t["none_c"])
+            if omitted:
+                mp = t["omitted"] % omitted + "\n" + mp
+            code = "\n\n---\n\n".join(b.text for b in recent) if recent else t["none_c"]
+            parts = [t["h_notes"], notes or t["none_t"], "", t["h_map"], mp, "", t["h_code"], code]
+            if question:
+                parts += ["", t["h_q"], question]
+            return "\n".join(parts)
+
+        notes, outlines, recent, omitted = self.text_notes, list(self.outlines), list(self.recent), 0
+        if (self.stats.get("pieces_lost") or self.stats.get("pieces_unreliable")
+                or self.stats.get("notes_cut_merge")):
+            notes = (notes + "\n[WARNING: %d piece(s) of the document were lost or read from a truncated "
+                     "context: that content is MISSING or UNRELIABLE. Say so if the "
+                     "question needs it.]"
+                     % (self.stats.get("pieces_lost", 0) + self.stats.get("pieces_unreliable", 0)
+                        + self.stats.get("notes_cut_merge", 0))).strip()
+        out = render(notes, omitted, outlines, recent)
+        while ntok(out) > budget and len(recent) > 1:
+            recent.pop(0)
+            out = render(notes, omitted, outlines, recent)
+        while ntok(out) > budget and len(outlines) > 1:
+            outlines.pop(0)
+            omitted += 1
+            out = render(notes, omitted, outlines, recent)
+        if ntok(out) > budget and notes:
+            over = ntok(out) - budget
+            notes = _cut_sentence(notes, max(200, len(notes) - int(over * self.cpt)))
+            out = render(notes, omitted, outlines, recent)
+        if ntok(out) > budget and recent:
+            recent = []                                    # last resort: outlines still describe the code
+            out = render(notes, omitted, outlines, recent)
+        return out
+
+
+# ----------------------------------------------------------------------------
+# Whole documents, PDFs, convenience wrapper
+# ----------------------------------------------------------------------------
+def process_document(source: Union[str, Sequence[str]], ask: Ask, *, budget_tokens: int = 2000,
+                     mode: str = "refine", lang: str = "en",
+                     on_progress: Optional[Callable[[int, int], None]] = None, **options: Any) -> Digest:
+    """Feed a document (one string, or a list of pages) into a Digest and return it."""
+    d = Digest(ask, budget_tokens=budget_tokens, mode=mode, lang=lang, **options)
+    pages = [source] if isinstance(source, str) else list(source)
+    for i, page in enumerate(pages, 1):
+        d.feed(page)
+        if on_progress:
+            try:
+                on_progress(i, len(pages))
+            except Exception as exc:
+                log.debug("on_progress failed: %s", exc)
+    return d
+
+
+def analyze(client: Any, source: Union[str, Sequence[str]], question: str, *, mode: str = "refine",
+            lang: str = "en", budget_tokens: Optional[int] = None,
+            on_progress: Optional[Callable[[int, int], None]] = None, **chat_options: Any) -> ChatReply:
+    """Digest ``source`` with ``client`` and answer ``question``. Every model call fits the window."""
+    strict = bool(chat_options.pop("strict", False))
+    flags = {"truncated": 0, "reduced": 0}
+    budget = budget_tokens or client.working_budget()
+    cpt = 3.2
+    try:
+        sample = (source if isinstance(source, str) else "".join(source))[:4000]
+        tok = getattr(client, "tokenizer", None) or LlamaServerTokenizer(client.base_url)
+        fn = getattr(tok, "try_count", None) or tok.count_exact
+        n = fn(sample)
+        if n and n > 0:
+            cpt = max(1.0, min(8.0, len(sample) / n))
+            log.info("measured %.2f chars/token on this document (default 3.2)", cpt)
+    except Exception as exc:
+        log.debug("chars/token measurement failed (%s): using 3.2", exc)
+    sysmsg = "You are a careful note-taker. Never invent facts."
+
+    def ask(prompt: str) -> str:
+        r = client.chat_full(prompt, sysmsg, temperature=0.2, thinking=False, continua=False,
+                           max_tokens=max(200, min(700, budget // 3)))
+        if r.meta.get("prompt_truncated"):
+            flags["truncated"] += 1
+        if r.meta.get("reduced"):
+            flags["reduced"] += 1
+        return r.text
+
+    d = process_document(source, ask, budget_tokens=budget, mode=mode, lang=lang,
+                         on_progress=on_progress, chars_per_token=cpt)
+    d.stats["pieces_unreliable"] = flags["truncated"]
+    log.info("digest: %s", d.stats)
+    lost = d.stats.get("pieces_lost", 0) + flags["truncated"]
+    if lost:
+        log.warning("digest lost %d piece(s): the document is incomplete", lost)
+        if strict:
+            raise ModelError("the digest lost %d piece(s): refusing to answer about "
+                             "incomplete content" % lost, kind="incomplete")
+    reply = client.chat_full(d.prompt(question, budget), **chat_options)
+    reply.meta["digest"] = dict(d.stats)
+    reply.meta["digest"].update(flags)
+    return reply
+
+
+def read_pdf_pages(path: str, timeout: float = 300.0) -> List[str]:
+    """Text of a PDF, one string per page. Uses ``pdftotext`` (Termux: ``pkg install poppler``),
+    else ``pypdf``/``PyPDF2`` if installed. Scanned PDFs need OCR: out of scope."""
+    exe = shutil.which("pdftotext")
+    if exe:
+        res = subprocess.run([exe, "-layout", path, "-"], capture_output=True, timeout=timeout)
+        if res.returncode == 0:
+            raw = res.stdout.decode("utf-8", "replace")
+            pages = [_clean_page(p) for p in raw.split("\f")]
+            while pages and not pages[-1].strip():
+                pages.pop()
+            return pages
+        raise RuntimeError("pdftotext failed: " + res.stderr.decode("utf-8", "replace")[:200])
+    for mod in ("pypdf", "PyPDF2"):
+        try:
+            lib = __import__(mod)
+        except ImportError:
+            continue
+        reader = lib.PdfReader(path)
+        return [_clean_page(pg.extract_text() or "") for pg in reader.pages]
+    raise RuntimeError("no PDF reader found: install poppler (Termux: pkg install poppler; "
+                       "Debian/Ubuntu: apt install poppler-utils) or pip install pypdf")
+
+
+def _clean_page(page: str) -> str:
+    page = re.sub(r"(\w)-\n(\w)", r"\1\2", page)
+    return re.sub(r"\n{3,}", "\n\n", page).strip("\n")
+
+
+# ----------------------------------------------------------------------------
+# Italian names of the first prototype
+# ----------------------------------------------------------------------------
+def classifica_blocco(blocco: str) -> str:
+    return "codice" if classify_block(blocco) == "code" else "testo"
+
+
+def dividi_misto(testo: str) -> List[Tuple[str, str]]:
+    return [("codice" if b.kind == "code" else "testo", b.text) for b in split_mixed(testo)]
+
+
+def estrai_logica_codice(codice: str) -> str:
+    return code_outline(codice)
+
+
+def processa_misto(testo_misto: str, chiedi_al_modello: Ask, max_riassunto: int = 800) -> Tuple[str, str, str]:
+    """Same contract as the prototype: returns (riassunto_testo, logica_codice, prompt_per_malg)."""
+    d = Digest(chiedi_al_modello, mode="refine", lang="it", budget_tokens=4000,
+               summary_chars=max_riassunto, summary_tokens=max(60, max_riassunto // 3))
+    d.feed(testo_misto)
+    return d.summary, d.code_map or "(nessun codice visto)", d.prompt()
+
+
+=== bocconcini/memory.py ===
+"""bocconcini.memory - verbatim chunks on disk, only the index in RAM.
+
+Standard library only. Python informs (structure, labels), the model decides
+(which branch to read). Nothing here calls a model or a server.
+"""
+from __future__ import annotations
+import ast, hashlib, json, os, re, shutil, time, zipfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+from .client import split_text, estimate_tokens
+__all__ = ["DocNode", "DocTree", "TreeError", "etichetta", "naviga", "albero_codice", "trova_fatti", "prepara_albero_ricco", "matrioska_profile", "prepare_matrioska_tree", "calibra_navigazione"]
+_MAX_BACKUPS = 5
+_DIARY_KEEP = 500
+_ZIP_ABOVE = 100
+
+
+class TreeError(RuntimeError):
+    """A branch could not be read. Never confused with an empty branch."""
+
+
+@dataclass
+class DocNode:
+    id: str
+    label: str = ""
+    summary: str = ""
+    text: str = ""
+    tokens: int = 0
+    children: List["DocNode"] = field(default_factory=list)
+
+
+_SAFE = re.compile(r"[^A-Za-z0-9_\-]+")
+
+
+def _key(node_id: str) -> str:
+    """Safe for the filesystem AND collision-free: ids that sanitize alike differ in the hash."""
+    raw = str(node_id or "")
+    stem = _SAFE.sub("_", raw.strip())[:48] or "nodo"
+    return "%s_%s" % (stem, hashlib.blake2b(raw.encode("utf-8", "replace"), digest_size=4).hexdigest())
+
+
+def _walk(nodes: List[DocNode]) -> Iterator[DocNode]:
+    stack = list(nodes)[::-1]
+    while stack:
+        n = stack.pop()
+        yield n
+        if n.children:
+            stack.extend(n.children[::-1])
+
+
+class DocTree:
+    def __init__(self, base_dir: Optional[Path] = None) -> None:
+        self.base = Path(base_dir) if base_dir else Path.home() / ".cache" / "bocconcini" / "workspace"
+        self.base.mkdir(parents=True, exist_ok=True)
+        self._idx_cache: Dict[str, Any] = {}
+
+    def _dir(self, session: str) -> Path:
+        return self.base / _key(session)
+
+    def _diary(self, action: str, session: str, detail: str) -> None:
+        try:
+            f = self.base / "diario.json"
+            rows = json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+            if not isinstance(rows, list):
+                rows = []
+            rows.append({"at": time.time(), "action": action, "session": session, "detail": detail[:400]})
+            tmp = f.with_name(f.name + ".tmp")
+            tmp.write_text(json.dumps(rows[-_DIARY_KEEP:], ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(f))
+        except Exception:
+            pass
+
+    def _backup(self, d: Path) -> Optional[Path]:
+        """Move the WHOLE previous version away; the caller puts the new one in its place."""
+        if not (d / "index.json").exists():
+            shutil.rmtree(d, ignore_errors=True)
+            return None
+        bdir = self.base / "_backup"
+        bdir.mkdir(parents=True, exist_ok=True)
+        stem = "%s_%d" % (d.name, int(time.time()))
+        dest, i = bdir / stem, 0
+        while dest.exists():
+            i += 1
+            dest = bdir / ("%s_%d" % (stem, i))
+        shutil.move(str(d), str(dest))
+        old = sorted(bdir.iterdir(), key=lambda q: q.stat().st_mtime)
+        for q in old[:-_MAX_BACKUPS]:
+            shutil.rmtree(q, ignore_errors=True)
+        return dest
+
+    @staticmethod
+    def _plain(n: DocNode) -> Dict[str, Any]:
+        d = {"id": str(n.id), "key": _key(n.id), "label": n.label,
+             "summary": n.summary, "tokens": int(n.tokens or 0), "chars": len(n.text or "")}
+        if n.children:
+            d["children"] = [DocTree._plain(c) for c in n.children]
+        return d
+
+    def save(self, session: str, roots: List[DocNode], meta: str = "") -> Dict[str, Any]:
+        nodes = list(_walk(roots))
+        seen = set()
+        for n in nodes:
+            k = str(n.id)
+            if k in seen:
+                raise TreeError("duplicate node id %r: two branches would overwrite each other" % k)
+            seen.add(k)
+        d = self._dir(session)
+        stage = d.with_name(d.name + ".new")
+        shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True, exist_ok=True)
+        mode = "zip" if len(nodes) > _ZIP_ABOVE else "singoli"
+        try:
+            if mode == "zip":
+                with zipfile.ZipFile(stage / "chunks.zip", "w", compression=zipfile.ZIP_DEFLATED) as z:
+                    for n in nodes:
+                        z.writestr(_key(n.id) + ".txt", n.text or "")
+                with zipfile.ZipFile(stage / "chunks.zip", "r") as z:
+                    have = set(z.namelist())
+                    for n in nodes:
+                        nm = _key(n.id) + ".txt"
+                        if nm not in have:
+                            raise TreeError("branch %r was not written" % n.id)
+                        z.read(nm)
+            else:
+                (stage / "chunks").mkdir(exist_ok=True)
+                for n in nodes:
+                    (stage / "chunks" / (_key(n.id) + ".txt")).write_text(n.text or "", encoding="utf-8")
+                for n in nodes:
+                    (stage / "chunks" / (_key(n.id) + ".txt")).read_text(encoding="utf-8")
+            idx = {"meta": meta, "mode": mode, "nodes": [self._plain(n) for n in roots]}
+            (stage / "index.json").write_text(json.dumps(idx, ensure_ascii=False), encoding="utf-8")
+        except UnicodeError as exc:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise TreeError("branch text contains unencodable characters (isolated surrogates?): %s" % exc) from exc
+        except Exception:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+        bk = self._backup(d)     # the old tree survives until the new one is complete and verified
+        try:
+            shutil.move(str(stage), str(d))
+        except Exception:
+            if bk is not None:
+                shutil.move(str(bk), str(d))    # put the old tree back: never leave the session empty
+            raise
+        self._idx_cache.pop(str(d), None)
+        self.index(session)
+        self._diary("save", session, "%d nodi, mode %s" % (len(nodes), mode))
+        return {"nodes": len(nodes), "mode": mode, "dir": str(d)}
+
+    def index(self, session: str) -> Dict[str, Any]:
+        d = self._dir(session)
+        p = d / "index.json"
+        if not p.exists():
+            raise TreeError("no tree saved for session %r" % session)
+        st = p.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+        hit = self._idx_cache.get(str(d))
+        if hit and hit[0] == sig:
+            return hit[1]
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as exc:
+            raise TreeError("index unreadable for %r: %s" % (session, exc)) from exc
+        self._idx_cache[str(d)] = (sig, data)
+        return data
+
+    def keys(self, session: str) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        stack = list(self.index(session).get("nodes") or [])
+        while stack:
+            n = stack.pop()
+            out[str(n["id"])] = n
+            stack.extend(n.get("children") or [])
+        return out
+
+    def load(self, session: str, node_id: str) -> str:
+        """The verbatim text of a branch. Raises if it cannot be read: an empty
+        branch returns "", a missing one raises. The model must never be handed
+        an empty string in place of a failure."""
+        info = self.keys(session).get(str(node_id))
+        if info is None:
+            raise TreeError("branch %r is not in the tree of session %r" % (node_id, session))
+        d = self._dir(session)
+        name = info["key"] + ".txt"
+        try:
+            if self.index(session).get("mode") == "zip":
+                with zipfile.ZipFile(d / "chunks.zip", "r") as z:
+                    return z.read(name).decode("utf-8", "replace")
+            return (d / "chunks" / name).read_text(encoding="utf-8")
+        except Exception as exc:
+            raise TreeError("branch %r exists in the index but cannot be read: %s" % (node_id, exc)) from exc
+
+    @staticmethod
+    def _find(nodes: List[Dict[str, Any]], wanted: str,
+              trail: List[str]) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        """Locate a node and return the FULL breadcrumb, ancestors included."""
+        for n in nodes:
+            here = trail + [str(n.get("label") or n["id"])]
+            if str(n["id"]) == wanted:
+                return n, here
+            got, gp = DocTree._find(n.get("children") or [], wanted, here)
+            if got is not None:
+                return got, gp
+        return None, []
+
+    def vista(self, session: str, node_id: Optional[str] = None, budget_tokens: int = 1200,
+              chars_per_token: float = 3.2, offset: int = 0) -> Dict[str, Any]:
+        """ONE level of the tree, sized to fit the prompt budget. Python informs.
+
+        Shows the children of ``node_id`` (the roots when None) with their labels.
+        What does not fit is COUNTED and declared, never silently dropped, and
+        ``next_offset`` lets the model ask for the following page.
+        """
+        roots = self.index(session).get("nodes") or []
+        path: List[str] = []
+        level = roots
+        if node_id is not None:
+            found, path = self._find(roots, str(node_id), [])
+            if found is None:
+                raise TreeError("branch %r is not in the tree of session %r" % (node_id, session))
+            level = found.get("children") or []
+        cap = max(200, int(budget_tokens * max(1.0, float(chars_per_token))))
+        head = "Percorso: " + (" > ".join(path) if path else "(radice)")
+        used = len(head) + 1
+        rows: List[str] = []
+        i = min(max(0, int(offset)), len(level))
+        first = i
+        ridotto = False
+        while i < len(level):
+            n = level[i]
+            row = "- id=%s | %s" % (n["id"], n.get("label") or "")
+            if n.get("summary"):
+                row += " | " + n["summary"]
+            row += " | %d token%s" % (int(n.get("tokens") or 0), ", ha figli" if n.get("children") else "")
+            if ridotto:
+                row = _riga_min(n, cap - used - 1)
+                if used + len(row) + 1 > cap:
+                    break
+            elif used + len(row) + 1 > cap:
+                if i > first:
+                    break
+                row = _riga_min(n, cap - used - 1)
+                ridotto = True
+            rows.append(row)
+            used += len(row) + 1
+            i += 1
+        left = len(level) - i
+        if left:
+            rows.append("[%d rami di questo livello non mostrati: offset=%d per la pagina successiva]" % (left, i))
+        return {"text": head + "\n" + "\n".join(rows), "shown": len(rows) - (1 if left else 0),
+                "omitted": left, "level_size": len(level), "next_offset": i if left else None,
+                "path": list(path)}
+
+
+_STOP = frozenset("""anche allora altro alcuni alcune ancora appena avere circa come contro cosa
+della delle dello degli dopo dove essere fatto hanno molto nulla ogni para pelo pela perche quando
+quale quali quello questo questa queste questi quelli sono stato sulla sulle sullo suoi their there
+these those things through thus were what when where which while will with would""".split())
+
+
+def _riga_min(n, spazio):
+    base = "- id=%s" % n["id"]
+    tail = " | %d token%s" % (int(n.get("tokens") or 0), ", ha figli" if n.get("children") else "")
+    lab = str(n.get("label") or "")[:80]
+    room = spazio - len(base) - len(tail) - 20
+    if room < 8 or not lab:
+        return base + tail + " [indice ridotto]"
+    return base + " | " + lab[:room] + tail + " [indice ridotto]"
+
+
+def etichetta(text: str, name: str = "", max_len: int = 160) -> Dict[str, str]:
+    """What Python can state about a branch WITHOUT inventing anything.
+
+    Code: the top-level def/class names (ast). Prose: first line, the numbers it
+    contains, and its most frequent content words. No model call, no guessing.
+    """
+    s = (text or "").strip()
+    if not s:
+        return {"label": "(vuoto)", "summary": ""}
+    label = ""
+    is_code = False
+    if (name or "").lower().endswith((".py", ".pyi", ".pyw")):
+        try:
+            body = ast.parse(s).body
+            names = [n.name for n in body
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+            if names:
+                label = "def/class: " + ", ".join(names[:8])
+                is_code = True
+        except SyntaxError:
+            pass
+    if not label:
+        for ln in s.split("\n"):
+            t = ln.strip().lstrip("#").strip()
+            if t:
+                label = t[:80]
+                break
+    nums = list(dict.fromkeys(re.findall(r"\b\d[\d.,/\-]{1,20}\b", s)))[:8]
+    freq: Dict[str, int] = {}
+    for w in re.findall(r"[A-Za-z\u00c0-\u00ff]{5,}", s.lower()):
+        if w not in _STOP:
+            freq[w] = freq.get(w, 0) + 1
+    top = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:6]
+    parts = []
+    if nums:
+        parts.append("numeri: " + ", ".join(nums))
+    if top and not is_code:
+        parts.append("termini: " + ", ".join(w for w, _ in top))
+    return {"label": label[:80], "summary": "; ".join(parts)[:max_len]}
+
+_LEGGI = {"type": "function", "function": {
+    "name": "leggi_nodo",
+    "description": ("Read one branch of the document tree. The text is on disk: only what you "
+                    "ask for enters your context. Older branches may be removed to make room, "
+                    "and you can read them again."),
+    "parameters": {"type": "object", "properties": {
+        "id": {"type": "string", "description": "the branch id shown in the index"}, "offset": {"type": "integer", "description": "character offset of the next page (0=start)"}},
+        "required": ["id"]}}}
+
+_REGOLE = (
+    "Il documento e' un albero su disco, non nel tuo contesto. Qui sotto vedi UN livello. "
+    "Per leggere un ramo chiama leggi_nodo(id). Il tuo contesto e' limitato: i rami letti "
+    "piu' vecchi vengono rimossi e sostituiti da un avviso, ma restano su disco e puoi "
+    "rileggerli. Quando puoi rispondere, rispondi senza chiamare strumenti. "
+    "Non inventare il contenuto di un ramo che non hai letto. "
+    "Le etichette e i numeri nell'indice sono INDIZI, non il documento: non citare un ramo "
+    "come fonte se non lo hai letto con leggi_nodo. Per un fatto del documento devi prima leggere. "
+    "L'indice mostra solo una pagina: se un nome non appare, usa cerca_nodo(query) per trovarlo.")
+
+
+def _msg_tokens(msgs: List[Dict[str, Any]], cpt: float, per_msg: float = 8.0) -> int:
+    return int(sum(len(str(m.get("content") or "")) for m in msgs) / cpt + per_msg * len(msgs))
+
+
+def _evict(msgs: List[Dict[str, Any]], budget: int, cpt: float, per_msg: float = 8.0, question: str = "", cost=None) -> int:
+    """Replace OLDER branch contents with a declared stub. Reversible: the text is
+    on disk. The NEWEST branch is never removed -- the model just asked for it."""
+    last_ai = max((i for i, m in enumerate(msgs) if m.get("role") == "assistant"), default=-1)
+    fresh = {i for i, m in enumerate(msgs) if m.get("role") == "tool" and i > last_ai}
+    removed = 0
+    while (cost(msgs) if cost is not None else _msg_tokens(msgs, cpt, per_msg)) > budget:
+        target = None
+        for i, m in enumerate(msgs):
+            if i not in fresh and m.get("role") == "tool" and not m.get("_stub"):
+                target = i
+                break
+        if target is None:
+            break
+        nid = msgs[target].get("_node") or ""
+        if nid:
+            kept = str(msgs[target].get("_facts") or "")
+            if not kept and question:
+                old = str(msgs[target].get("content") or "")
+                words = {w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9_]{3,}", question)}
+                parts = re.split(r"(?<=[.!?])\s+", old)
+                kept = " ".join(seg.strip() for seg in parts if any(w in seg.lower() for w in words))[:180]
+            keep = (" facts found -> " + kept + ".") if kept else ""
+            msgs[target]["content"] = ("[branch %s evicted from context.%s Text stays on disk; "
+                                       "ask leggi_nodo for %s again]" % (nid, keep, nid))
+        else:
+            msgs[target]["content"] = "[esito precedente rimosso per fare spazio; usa cerca_nodo o leggi_nodo se ti serve]"
+        msgs[target]["_stub"] = True
+        removed += 1
+    return removed
+
+
+def _level_ids(tree: "DocTree", session: str, node_id: Optional[str] = None) -> List[str]:
+    if node_id is None:
+        return [str(n["id"]) for n in (tree.index(session).get("nodes") or [])]
+    return [str(c["id"]) for c in (tree.keys(session).get(node_id, {}).get("children") or [])]
+
+
+_CERCA = {"type": "function", "function": {
+    "name": "cerca_nodo",
+    "description": "Search ids, labels, summaries AND the verbatim text of every branch. Returns full ids. Use it when what you need is not on the visible page.",
+    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
+
+_SFOGLIA = {"type": "function", "function": {
+    "name": "sfoglia_pagina",
+    "description": "Show the next page of branches at the current level. Use when the index says more branches are available.",
+    "parameters": {"type": "object", "properties": {
+        "offset": {"type": "integer", "description": "the offset value from the index message"}},
+    "required": ["offset"]}}}
+
+
+
+_LEGGI_RAMO = {"type": "function", "function": {
+    "name": "leggi_ramo",
+    "description": "Read the full content of a branch that was spilled to disk. Use when you see '[content on disk: id=...]' in a message.",
+    "parameters": {"type": "object", "properties": {
+        "id": {"type": "string", "description": "the branch id from the placeholder message"}},
+        "required": ["id"]}}}
+
+def _cerca(tree: "DocTree", session: str, query: str, limit: int = 8) -> Tuple[str, List[str]]:
+    """Matrioska-aware fuzzy search.
+
+    Search ids, labels, summaries and verbatim leaf text. The model paraphrases:
+    do not require an exact phrase. Prefer leaves over containers, because opening
+    a container only burns a navigation step.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return "[empty query]", []
+
+    def norm(s: str) -> str:
+        return re.sub(r"[\W_]+", "", (s or "").lower())
+
+    stop = {
+        "qual", "quale", "quali", "what", "which", "the", "and", "for",
+        "with", "from", "this", "that", "della", "delle", "dello", "degli",
+        "del", "dei", "gli", "una", "uno", "per", "con", "che", "non",
+        "sono", "nel", "nella", "nelle", "negli", "alla", "allo", "agli",
+    }
+
+    raw_words = re.findall(r"[a-z0-9à-ù]{3,}", q)
+    words: List[str] = []
+    for w in raw_words:
+        if w in stop:
+            continue
+        if w not in words:
+            words.append(w)
+    if not words and q:
+        words = [q]
+
+    nq = norm(q)
+    keys = tree.keys(session)
+    candidates = []
+
+    for k in sorted(keys):
+        node = keys[k]
+        is_container = bool(node.get("children"))
+        meta = " ".join([
+            str(k),
+            str(node.get("label", "")),
+            str(node.get("summary", "")),
+        ])
+        text = ""
+        if not is_container:
+            try:
+                text = tree.load(session, k)
+            except TreeError:
+                continue
+
+        hay = meta + "\n" + text
+        low = hay.lower()
+        nh = norm(hay)
+        score = 0
+        matched: List[str] = []
+
+        if q and q in low:
+            score += 30
+        if nq and len(nq) >= 3 and nq in nh:
+            score += 20
+
+        for w in words:
+            c = low.count(w)
+            if c:
+                score += min(c, 5) * (2 if not is_container else 1)
+                matched.append(w)
+
+        if score <= 0:
+            continue
+
+        # Prefer actual text leaves over macro containers.
+        if not is_container:
+            score += 5
+
+        preview = str(node.get("summary") or node.get("label") or "")
+        pos = -1
+        low_text = text.lower()
+        for w in matched or words:
+            pos = low_text.find(w)
+            if pos >= 0:
+                break
+        if pos >= 0:
+            a, b = max(0, pos - 70), min(len(text), pos + 150)
+            preview = " ".join(text[a:b].split())
+
+        candidates.append((score, 1 if is_container else 0, k, preview, is_container))
+
+    candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+    picked = candidates[:max(1, int(limit))]
+
+    if not picked:
+        return "[no branch matches %r. Try another word.]" % query, []
+
+    out = ["%d matches, showing %d. Read a LEAF." % (len(candidates), len(picked))]
+    ids: List[str] = []
+    for score, _cflag, k, preview, is_container in picked:
+        tag = "CONTAINER" if is_container else "LEAF"
+        out.append("- %s [%s] score=%d | %s" % (k, tag, score, preview[:160]))
+        ids.append(k)
+    return "\n".join(out), ids
+
+
+
+def _parse_text_tool_calls(text: str, tools_available: list) -> list:
+    """Parse tool calls from text content. Models may write <tool_call> as text instead of structured calls."""
+    if not text:
+        return []
+    
+    calls = []
+    # Pattern 1: <function=name>args</function>
+    for tool in tools_available:
+        fname = tool.get("function", {}).get("name", "")
+        if not fname:
+            continue
+        # Match <function=leggi_nodo>{"id": "sec_1"}</function> or similar
+        pattern = rf'<function={re.escape(fname)}>(.*?)</function>'
+        for match in re.finditer(pattern, text, re.DOTALL | re.IGNORECASE):
+            try:
+                args_str = match.group(1).strip()
+                if not args_str:
+                    continue
+                # Try to parse as JSON
+                args = json.loads(args_str)
+                calls.append({
+                    "id": f"call_{fname}_{len(calls)}",
+                    "type": "function",
+                    "function": {
+                        "name": fname,
+                        "arguments": json.dumps(args)
+                    }
+                })
+            except:
+                continue
+    return calls
+
+
+def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
+           budget_tokens: Optional[int] = None, chars_per_token: float = 3.2,
+           max_hops: Optional[int] = None, max_repeats: int = 2, max_tokens: int = 400,
+           temperature: float = 0.2, require_read: bool = True, max_calls: Optional[int] = None) -> Dict[str, Any]:
+    """The model navigates, Python informs and enforces the budget.
+
+    ``max_hops`` reads, then ONE final turn with no tools: the model answers with
+    what it has, or says it does not know. An invented id is answered with the
+    list of real ones, because a small model deduces ids instead of copying them.
+    Eviction is declared and reversible: the text never leaves the disk.
+    """
+    budget = int(budget_tokens or client.working_budget(reserve=0))
+    cpt = max(1.0, float(chars_per_token))
+    try:
+        ovh = float(client._hw().get("msg_overhead") or 8.0)
+    except Exception:
+        ovh = 8.0
+    meta: Dict[str, Any] = {"hops": 0, "nodes_read": [], "evicted": 0, "repeats": 0,
+                            "branches_cut": [], "unknown_ids": [], "forced_answer": False,
+                            "answered_from_index": False, "stopped": "", "budget": budget}
+    roots = tree.index(session).get("nodes") or []
+    focus = None
+    if len(roots) == 1 and roots[0].get("children"):
+        focus = str(roots[0]["id"])        # bare container: show the useful level immediately
+    shown = _level_ids(tree, session, focus)
+    vista = tree.vista(session, focus, budget_tokens=max(150, budget // 4), chars_per_token=cpt)
+    toks = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question))
+    named = [k for k in tree.keys(session) if k.rsplit(".", 1)[-1] in toks][:3]
+    hint = ("\n\nNomi della domanda presenti nell'albero (id completi): " + ", ".join(named)) if named else ""
+    msgs: List[Dict[str, Any]] = [
+        {"role": "system", "content": _REGOLE + "\n\n" + vista["text"] + hint},
+        {"role": "user", "content": question}]
+    seen: Dict[str, int] = {}
+    answer = ""
+    if max_hops is None: max_hops = max(matrioska_profile(client)["max_hops"], _tree_depth(roots) + max_repeats + 1)
+    hops = max(0, int(max_hops))
+    if max_calls is None: max_calls = matrioska_profile(client)["max_calls"]
+    for turn in range(hops + 1):
+        if meta.get("_notice"):
+            msgs.append({"role": "user", "content": meta.pop("_notice")})
+        final = turn >= hops
+        tools_now = None if final else [_LEGGI, _CERCA, _SFOGLIA] + ([_LEGGI_RAMO] if getattr(client, "spill", False) else [])
+        tt = _tools_tokens(client, tools_now)
+        meta["evicted"] += _evict(msgs, max(200, budget - max_tokens), cpt, ovh, question, cost=lambda ms: client._prompt_tokens(ms, tt))
+        try:
+            tt = _tools_tokens(client, tools_now)
+            pt = client._prompt_tokens(msgs, tt)
+        except Exception:
+            pt = _msg_tokens(msgs, cpt, ovh) + (256 if tools_now else 0)
+        if pt > budget:
+            meta["stopped"] = "budget: prompt ~%d > %d" % (pt, budget)
+            break
+        cap = _read_cap(client, msgs, tt, budget, max_tokens if final else 0, max_calls, cpt); meta.setdefault("caps",[]).append(cap)
+        if final:
+            meta["forced_answer"] = True
+        try:
+            cs = meta.get("_consecutive_searches", 0)
+            if require_read and not meta["nodes_read"] and not final and cs >= 2:
+                tc = {"type": "function", "function": {"name": "leggi_nodo"}}
+            else:
+                tc = "required" if (require_read and not meta["nodes_read"] and not final) else None
+            r = client.chat_full(messages=msgs, tools=tools_now, tool_choice=tc,
+                                 temperature=temperature, max_tokens=max_tokens, continua=False)
+        except Exception as exc:
+            meta["stopped"] = "error: %s" % exc
+            break
+        if not r.tool_calls:
+            # Check if model wrote tool calls as text instead of structured calls
+            text_calls = _parse_text_tool_calls(r.text, tools_now or [])
+            if text_calls:
+                # Model wrote tool calls as text, execute them
+                r.tool_calls = text_calls
+            else:
+                if require_read and not meta["nodes_read"] and not final and not meta.get("nudged"):
+                    meta["nudged"] = True
+                    msgs.append({"role": "user", "content": "Non hai letto nessun ramo. L'indice non e' il documento: chiama cerca_nodo o leggi_nodo prima di rispondere."})
+                    continue
+                answer = r.text
+                break
+        meta["hops"] += 1
+        calls = [c for c in r.tool_calls if str(c.get("function", {}).get("name")) == "cerca_nodo"][:4] + [c for c in r.tool_calls if str(c.get("function", {}).get("name")) != "cerca_nodo"][:max(1, int(max_calls))]
+        if len(r.tool_calls) > len(calls):
+            meta["deferred"] = meta.get("deferred", 0) + len(r.tool_calls) - len(calls)
+            meta["_notice"] = ("[%d calls asked, %d honoured; "
+                               "ask the rest one per turn.]" % (len(r.tool_calls), len(calls)))
+        msgs.append({"role": "assistant", "content": r.text or "", "tool_calls": calls})
+        valid = tree.keys(session)
+        reads_turn = 0
+        for call in calls:
+            try:
+                args = json.loads(call.get("function", {}).get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            fname = str(call.get("function", {}).get("name") or "")
+            if fname == "cerca_nodo":
+                q = str(args.get("query") or args.get("id") or "")
+                qn = q.strip().lower()
+                cache = meta.setdefault("_search_cache", {})
+                if qn in cache:
+                    body = "[repeat: %s] ids: %s. Read a LEAF." % (q, cache[qn] or "none")
+                    _h = []
+                else:
+                    body, _h = _cerca(tree, session, q, 4)
+                    cache[qn] = ", ".join(_h[:4])
+                meta.setdefault("searches", []).append(q)
+                consecutive_searches = meta.get('_consecutive_searches', 0) + 1
+                meta['_consecutive_searches'] = consecutive_searches
+                msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": body, "_node": ""})
+                continue
+            if fname == "sfoglia_pagina":
+                off = int(args.get("offset") or 0)
+                sub = tree.vista(session, focus, budget_tokens=max(150, budget // 4), chars_per_token=cpt, offset=off)
+                meta.setdefault("pages_browsed", []).append(off)
+                msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": sub["text"], "_node": ""})
+                continue
+            if fname == "leggi_ramo":
+                branch_id = str(args.get("id") or "")
+                if not branch_id or not hasattr(client, "_store") or client._store is None:
+                    msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": "[branch not available]", "_node": ""})
+                    continue
+                try:
+                    content = client._store.get(branch_id)
+                    msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": content, "_node": branch_id})
+                except Exception as exc:
+                    msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": f"[error reading branch: {exc}]", "_node": ""})
+                continue
+            if fname in ("leggi_nodo",):
+                meta['_consecutive_searches'] = 0  # Reset contatore ricerche consecutive
+
+            if fname not in ("", "leggi_nodo"):
+                msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": "[strumento sconosciuto: usa leggi_nodo o cerca_nodo]", "_node": ""})
+                continue
+            nid = str(args.get("id") or ""); o = max(0, int((re.findall(r"\d+", str(args.get("offset") or 0)) or ["0"])[0]))
+            nf = ""
+            if not nid:
+                meta["empty_ids"] = meta.get("empty_ids", 0) + 1
+                sug = ", ".join(named or shown) or "(nessuno)"
+                msgs.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                             "content": "[id vuoto: chiama leggi_nodo con l'id completo di un ramo, es. %s]" % sug,
+                             "_node": ""})
+                continue
+            if nid not in valid:
+                bare = nid.rsplit(".", 1)[-1]
+                cand = [k for k in valid if k.rsplit(".", 1)[-1] == bare]
+                if len(cand) == 1:
+                    meta.setdefault("resolved_names", []).append("%s -> %s" % (nid, cand[0]))
+                    nid = cand[0]
+                elif len(cand) > 1:
+                    meta.setdefault("ambiguous", []).append(nid)
+                    msgs.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                                 "content": "[nome ambiguo: usa l'id completo, uno di questi: %s]"
+                                            % ", ".join(cand[:6]), "_node": nid})
+                    continue
+            if nid not in valid:
+                meta["unknown_ids"].append(nid)
+                body = ("[il ramo %r NON ESISTE. Non inventare id: copia uno di questi, che sono "
+                        "quelli elencati: %s]" % (nid, ", ".join(shown) or "(nessuno)"))
+            elif seen.get((nid, o), 0) >= max_repeats and any((m.get("_node"), m.get("_off", 0))==(nid, o) and not m.get("_stub") for m in msgs):
+                meta["repeats"] += 1
+                body = ("[hai gia' letto il ramo %s %d volte: non te lo rimando. Usa quello che "
+                        "hai, o chiedi un altro ramo.]" % (nid, seen.get((nid, o), 0)))
+            elif reads_turn and _msg_tokens(msgs, cpt, ovh) + int(min(cap, int(valid.get(nid, {}).get("chars") or cap)) / cpt) + 8 > max(200, budget - max_tokens):
+                meta["deferred"] = meta.get("deferred", 0) + 1
+                body = ("[branch %s NOT read: this turn already carries %d branch(es). "
+                        "Ask for it again on the next turn.]" % (nid, reads_turn))
+            else:
+                reads_turn += 1
+                try:
+                    full = tree.load(session, nid)
+                    meta["nodes_read"].append(nid)
+                    seen[(nid, o)] = seen.get((nid, o), 0) + 1
+                    body = full
+                    nf = ", ".join("%s:%s" % (f["tipo"], f["valore"]) for f in trova_fatti(full))[:180]
+                    if len(body) > cap:
+                        body = full[o:o+cap] + (chr(10)+'[%d/%d chars; next leggi_nodo(id=%s, offset=%d)]' % (o+cap, len(full), nid, o+cap))
+                        if o+cap >= len(full): body = full[o:] + (chr(10)+'[end of branch %s: %d chars]' % (nid, len(full)))
+                        meta["branches_cut"].append(nid)
+                    kids = valid.get(nid, {}).get("children")
+                    if kids:
+                        shown = [str(c["id"]) for c in kids]; focus = nid
+                        sub = tree.vista(session, nid, budget_tokens=max(120, budget // 4),
+                                         chars_per_token=cpt)
+                        body += ("\n\n[questo ramo e' un contenitore: chiama leggi_nodo con UNO "
+                                 "di questi id]\n" + sub["text"])
+                    elif not full.strip():
+                        body = "[il ramo %s non contiene testo]" % nid
+                except TreeError as exc:
+                    body = "[ramo non leggibile: %s]" % exc
+                    meta.setdefault("unreadable", []).append(nid)
+            msgs.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                         "content": body, "_node": nid, "_off": o, "_facts": nf})
+    if answer and not meta["nodes_read"]:
+        meta["answered_from_index"] = True
+    if not answer and not meta["stopped"]:
+        meta["stopped"] = "no_answer"
+    tt = _tools_tokens(client, tools_now)
+    meta["evicted"] += _evict(msgs, budget, cpt, ovh, question, cost=lambda ms: client._prompt_tokens(ms, tt))
+    return {"text": answer, "meta": meta, "messages": msgs}
+
+_DEFNODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _span(n: ast.AST) -> Tuple[int, int]:
+    starts = [n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])]
+    return min(starts), int(getattr(n, "end_lineno", n.lineno))
+
+
+def _sig(n: ast.AST) -> str:
+    if isinstance(n, ast.ClassDef):
+        return "class " + n.name
+    a = n.args
+    names = [x.arg for x in list(getattr(a, "posonlyargs", [])) + list(a.args)]
+    if a.vararg:
+        names.append("*" + a.vararg.arg)
+    if a.kwarg:
+        names.append("**" + a.kwarg.arg)
+    kw = "async def " if isinstance(n, ast.AsyncFunctionDef) else "def "
+    return kw + n.name + "(" + ", ".join(names) + ")"
+
+
+def _calls(n: ast.AST) -> List[str]:
+    out: List[str] = []
+    for x in ast.walk(n):
+        if isinstance(x, ast.Call):
+            f = x.func
+            nm = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
+            if nm and nm not in out:
+                out.append(nm)
+    return out
+
+
+def _nodo(lines: List[str], lo: int, hi: int, body: List[Any], ident: str,
+          label: str, ast_node: Any, count: Callable[[str], int]) -> DocNode:
+    """Partition by line range: the parent keeps every line no child covers.
+    Lossless by construction -- each line belongs to exactly one node."""
+    # Lossless: each line in [lo, hi] lands in exactly one node.
+    # Spans are computed from the actual text of children, not AST end_lineno,
+    # so trailing blank lines are never silently swallowed.
+    spans = sorted((_span(n), n) for n in body if isinstance(n, _DEFNODES))
+    kids = [_nodo(lines, a, b, getattr(n, "body", []), ident + "." + n.name,
+                  _sig(n), n, count) for (a, b), n in spans]
+    # Approccio più robusto: ogni figlio occupa esattamente le righe che contiene il suo testo
+    covered_real: set = set()
+    for k in kids:
+        if k._span_real:
+            covered_real.update(k._span_real)
+    own_lines = [lines[i - 1] for i in range(lo, hi + 1) if i not in covered_real]
+    own = "\n".join(own_lines)
+    doc = (ast.get_docstring(ast_node) or "") if ast_node is not None else ""
+    parts = []
+    if doc.strip():
+        parts.append(doc.strip().split("\n")[0][:110])
+    calls = _calls(ast_node) if ast_node is not None else []
+    if calls:
+        parts.append("chiama: " + ", ".join(calls))
+    node = DocNode(id=ident, label=label[:110], summary="; ".join(parts)[:200],
+                   text=own, tokens=count(own), children=kids)
+    node._doc = doc.strip().split("\n")[0][:110] if doc.strip() else ""
+    node._span_real = list(range(lo, hi + 1))
+    node._raw_calls = calls
+    return node
+
+
+def albero_codice(path: Any, counter: Optional[Callable[[str], int]] = None) -> List[DocNode]:
+    """Build a tree from Python source with ast. NOTHING is compressed: every line
+    of every file lands verbatim in exactly one node. Labels are real signatures,
+    summaries carry the docstring's first line and the names the node calls, so the
+    model follows dependencies instead of guessing. No model call, no invention.
+    """
+    count = counter or (lambda t: int(len(t) / 3.2) + 1 if t else 0)
+    root = Path(path)
+    files = sorted(root.rglob("*.py")) if root.is_dir() else [root]
+    mods: List[DocNode] = []
+    for f in files:
+        src = f.read_text(encoding="utf-8", errors="replace")
+        lines = src.split("\n")
+        try:
+            mod = ast.parse(src)
+        except SyntaxError as exc:
+            mods.append(DocNode(id=f.stem, label="%s (NON ANALIZZABILE: %s)" % (f.name, exc),
+                                text=src, tokens=count(src)))
+            continue
+        rel = f.stem if not root.is_dir() else ".".join(f.relative_to(root).with_suffix("").parts)
+        mods.append(_nodo(lines, 1, len(lines), mod.body, rel, rel + " (" + f.name + ")", mod, count))
+    roots = [DocNode(id=root.name, label="package " + root.name, children=mods)] if root.is_dir() else mods
+    _filtra_chiama(roots)
+    return roots
+
+def _filtra_chiama(roots: List[DocNode]) -> None:
+    """Keep only calls that are real nodes: every name listed must be reachable."""
+    nodes = list(_walk(roots))
+    known = {n.id.rsplit(".", 1)[-1] for n in nodes}
+    for n in nodes:
+        raw = getattr(n, "_raw_calls", None)
+        if raw is None:
+            continue
+        useful = [c for c in raw if c in known]
+        parts = []
+        if getattr(n, "_doc", ""):
+            parts.append(n._doc)
+        if useful:
+            shown = useful[:8]
+            txt = "chiama: " + ", ".join(shown)
+            if len(useful) > len(shown):
+                txt += " (+%d altri)" % (len(useful) - len(shown))
+            parts.append(txt)
+        n.summary = "; ".join(parts)[:200]
+
+_FATTO = (
+    ("codice", re.compile(r"\b[A-Z][A-Z0-9]{2,}[-_][A-Z0-9]{1,8}\b")),
+    ("sigla", re.compile(r"\b[A-Z]{3,}\d{1,6}\b")),
+    ("numero", re.compile(r"\b\d{4,}\b")),
+    ("nome", re.compile(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*\b")),
+    ("misura", re.compile(r"\b\d+(?:[.,]\d+)?\s?(?:terawatt|gigawatt|megawatt|kilowatt|watt|TB|GB|MB|GHz|MHz|volt|ampere)\b", re.I)),
+    ("chiave", re.compile(r"\b[A-Za-z0-9_\-]{16,}\b")),
+    ("virgolette", re.compile(r'"([^"\n]{3,60})"')),
+)
+
+
+def trova_fatti(testo: str, max_per_tipo: Optional[int] = None, contesto: int = 90) -> List[Dict[str, Any]]:
+    """Exhaustive deterministic scan for candidate FACTS, with their context.
+
+    Python reads EVERY character (cheap, lossless) and hands the model a small
+    candidate set to judge: nothing is compressed, nothing is dropped in silence.
+    Each hit carries its position and the words around it, so a fact can be
+    matched to a question -- and verified -- without reading the document.
+    """
+    testo = testo or ""
+
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for tipo, rx in _FATTO:
+        n = 0
+        for m in rx.finditer(testo):
+            v = (m.group(1) if m.groups() else m.group(0)).strip()
+            if not v or (tipo, v) in seen:
+                continue
+            if tipo == "chiave" and not (any(c.isdigit() for c in v) and any(c.isalpha() for c in v)):
+                continue                      # an API key mixes letters and digits; a long word does not
+            seen.add((tipo, v))
+            a, b = max(0, m.start() - contesto), min(len(testo), m.end() + 40)
+            out.append({"tipo": tipo, "valore": v, "pos": m.start(),
+                        "percentuale": round(100.0 * m.start() / max(1, len(testo)), 1),
+                        "contesto": " ".join(testo[a:b].split())})
+            n += 1
+            if max_per_tipo is not None and n >= max_per_tipo: break
+    out.sort(key=lambda d: d["pos"])
+    return out
+
+
+def _fatti_in_range(tutti_i_fatti, start, end, signal_rank, tetto_fatti):
+    """Blocco 'CHIAVE -> ...' con i fatti (ordinati per rarita') in [start, end)."""
+    fatti = [
+        "%s:%s" % (f["tipo"], f["valore"])
+        for f in tutti_i_fatti
+        if start <= f["pos"] < end
+    ]
+    if not fatti:
+        return ""
+    fatti.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
+    visibili, usati = [], 0
+    for f in fatti:
+        f = f if len(f) <= 80 else f[:77] + "..."
+        if visibili and usati + len(f) + 2 > tetto_fatti:
+            break
+        visibili.append(f)
+        usati += len(f) + 2
+    blocco = "CHIAVE -> " + ", ".join(visibili)
+    resto = len(fatti) - len(visibili)
+    if resto:
+        blocco += " (+%d altri nel ramo)" % resto
+    return blocco
+
+
+def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"] = None, 
+                          max_chars: int = 1500, max_per_tipo: int = 100, tetto_fatti: int = 180, mode="auto", max_children=None, client=None) -> Tuple["DocTree", str]:
+    """Costruisce un albero con summary arricchiti dai fatti deterministici.
+    
+    Chunka il documento, estrae tutti i fatti con trova_fatti(), e per ogni chunk
+    inserisce nel summary i fatti che cadono in quel range. Questo rende i fatti
+    visibili nell'indice senza dover aprire i rami.
+    
+    Args:
+        documento: testo completo da indicizzare
+        sessione: nome della sessione per DocTree
+        tree: DocTree esistente (se None, usa ~/.cache/bocconcini/workspace)
+        max_chars: dimensione massima dei chunk
+        max_per_tipo: quanti fatti estrarre per tipo (default 100 invece di 40)
+        tetto_fatti: max characters of the fact block in each summary (default 180).
+            Facts are ordered by GLOBAL RARITY of their type: a type with 4 hits in
+            the document is signal, one with 100 hits is noise, so rare types are
+            rendered first. What does not fit is counted and declared, never dropped
+            in silence; the verbatim text of every branch stays on disk.
+    
+    Returns:
+        (tree, sessione) - il tree con l'albero salvato
+    
+    Example:
+        >>> import bocconcini as b
+        >>> import bocconcini.memory as t
+        >>> tree, session = t.prepara_albero_ricco(documento_enorme, "test")
+        >>> risultato = t.naviga(client, tree, session, domanda, budget_tokens=1500)
+    """
+    if tree is None:
+        tree = DocTree()
+    
+    # 1. Chunking del documento
+    chunks = split_text(documento, name="documento.txt", kind="text", 
+                       max_chars=max_chars, max_tokens=10000, min_chars=300, overlap=0)
+    
+    # 2. Estrazione deterministica di tutti i fatti
+    tutti_i_fatti = trova_fatti(documento)
+    fact_counts = {}
+    for f in tutti_i_fatti:
+        fact_counts[f["tipo"]] = fact_counts.get(f["tipo"], 0) + 1
+    signal_rank = {t: i for i, t in enumerate(sorted(fact_counts, key=lambda t: (fact_counts[t], t)))}
+    
+    # 3. Costruzione dei nodi con summary arricchiti
+    roots = []
+    for i, ch in enumerate(chunks):
+        node_id = f"sec_{i:03d}"
+        
+        # Etichetta standard
+        meta_etichetta = etichetta(ch.text, name="documento.txt")
+        
+        # Trova i fatti che cadono in questo chunk
+        fatti_nel_chunk = [
+            f"{f['tipo']}:{f['valore']}" 
+            for f in tutti_i_fatti 
+            if ch.start <= f['pos'] < ch.end
+        ]
+        
+        # Arricchisci il summary
+        # Rarest fact types first: 100 hits of a type is noise, 4 hits is signal.
+        fatti_nel_chunk.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
+        summary_base = meta_etichetta["summary"]
+        if fatti_nel_chunk:
+            visibili, usati = [], 0
+            for f in fatti_nel_chunk:
+                f = f if len(f) <= 80 else f[:77] + "..."
+                if visibili and usati + len(f) + 2 > tetto_fatti:
+                    break
+                visibili.append(f)
+                usati += len(f) + 2
+            blocco = "CHIAVE -> " + ", ".join(visibili)
+            resto = len(fatti_nel_chunk) - len(visibili)
+            if resto:
+                blocco += " (+%d altri nel ramo)" % resto
+            summary_base = blocco + (" | " + summary_base if summary_base else "")
+        
+        roots.append(DocNode(
+            id=node_id,
+            label=f"Sezione {i} (pos {ch.start}-{ch.end})",
+            summary=summary_base,
+            text=ch.text,
+            tokens=ch.token_count_estimate()
+        ))
+    
+    # 4. Salvataggio dell'albero
+    # --- Matriosca: raggruppa le foglie in macro-blocchi padre->figli ---
+    if max_children is None:
+        if client is not None:
+            try:
+                max_children = int(matrioska_profile(client).get("max_children", 8))
+            except Exception:
+                max_children = 8
+        else:
+            max_children = 8
+    max_children = max(2, int(max_children))
+    if mode in ("matriosca", "auto") and len(roots) > max_children:
+        foglie = roots
+        roots = []
+        for g in range(0, len(foglie), max_children):
+            gruppo = foglie[g:g + max_children]
+            inizio = chunks[g].start
+            fine = chunks[g + len(gruppo) - 1].end
+            blocco = _fatti_in_range(tutti_i_fatti, inizio, fine, signal_rank, tetto_fatti)
+            if not blocco:
+                # Fallback: eredita i summary delle foglie (termini frequenti, numeri)
+                parti = [c.summary for c in gruppo if c.summary]
+                if parti:
+                    blocco = " | ".join(parti)
+                    if len(blocco) > tetto_fatti * 2:
+                        blocco = blocco[:tetto_fatti * 2 - 3] + "..."
+            roots.append(DocNode(
+                id="macro_%02d" % (g // max_children),
+                label="Macro-blocco %d (sezioni %d-%d)" % (g // max_children, g, g + len(gruppo) - 1),
+                summary=blocco,
+                text="",
+                tokens=sum(c.tokens for c in gruppo),
+                children=gruppo,
+            ))
+    tree.save(sessione, roots)
+    
+    return tree, sessione
+
+
+def calibra_navigazione(client, max_profondita=10, budget_tokens=1500,
+                         session_prefix="calib_naviga") -> int:
+    """Misura quanti livelli di profondita' il modello riesce a navigare prima di perdere il filo.
+
+    Costruisce alberi lineari di profondita' crescente. L'ago (un codice) e' sempre
+    nell'ultimo nodo. Per ogni profondita', naviga() deve trovarlo. Quando smette di
+    trovarlo, quella e' la profondita' limite.
+
+    Returns: la profondita' massima navigata con successo (0 = nessuna).
+    """
+    limite = 0
+    for prof in range(1, max_profondita + 1):
+        ago = "%04d" % (int.from_bytes(os.urandom(2), "big") % 9000 + 1000)
+        nodo = None
+        for i in range(prof - 1, -1, -1):
+            if i == prof - 1:
+                nodo = DocNode(id="sec_%03d" % i, label="Sezione %d" % i,
+                              summary="Contiene un codice di verifica",
+                              text="Il codice di verifica e' %s." % ago)
+            else:
+                nodo = DocNode(id="sec_%03d" % i, label="Sezione %d" % i,
+                              summary="Contenitore, ha un sotto-ramo",
+                              text="Questa sezione rimanda al suo sotto-ramo.",
+                              children=[nodo])
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tree = DocTree(Path(td))
+            session = "%s_%d" % (session_prefix, prof)
+            tree.save(session, [nodo])
+            out = naviga(client, tree, session,
+                        "Qual e' il codice di verifica?",
+                        budget_tokens=budget_tokens, max_hops=prof + 2)
+            if ago in out.get("text", ""):
+                limite = prof
+            else:
+                break
+    return limite
+
+
+def _ask_windows(client,wins,tg,question,max_tokens,temperature,room):
+    out,calls,biggest=[],0,0
+    for batch in _fit_batches(wins,room):
+            p = ("ORIGINAL REQUEST: " + str(question) + "\n\n"
+                            + "VERBATIM EXCERPTS (from the document):\n"
+                            + "\n".join("- " + w for w in batch) + "\n\n"
+                            + "Find the SPECIFIC value for '" + str(tg) + "' in the excerpts above. "
+                            + "The value is typically a code (e.g., XXX-9999), number, date, name, or status that appears "
+                            + "immediately before or after '" + str(tg) + "'. "
+                            + "Copy the exact text character by character. Do not paraphrase or invent.\n"
+                            + "If you cannot find a clear value for '" + str(tg) + "', reply exactly: NOT FOUND\n"
+                            + "Answer with the copied value only (no explanation, no preamble, no quotes).")
+
+            biggest = max(biggest, len(p))
+            r = client.chat_full(prompt=p, max_tokens=max_tokens,
+                                 temperature=temperature, continua=False)
+            calls += 1
+            out.append((tg, (r.text or "").strip()))
+    return out,calls,biggest
+
+
+def ask_stepwise(client, documento: str, question: str, *, targets=None,
+                 max_tokens: Optional[int] = None, window: Optional[int] = None, per_target: Optional[int] = None,
+                 temperature: float = 0.0) -> Dict[str, Any]:
+    """One target at a time, each in a FRESH context. Python keeps the findings.
+
+    The model never has to remember what it already did: every sub-task starts
+    with an empty history and sees only the verbatim windows for ITS target.
+    The answers accumulate outside the model, so nothing is ever evicted.
+    """
+    low = documento.lower()
+    if max_tokens is None:
+        max_tokens = matrioska_profile(client)["answer_tokens"]
+    if window is None:
+        frasi = [len(f) for f in documento.split('.') if len(f) > 10]
+        avg_frase = sum(frasi) // max(1, len(frasi)) if frasi else 100
+        window = max(100, avg_frase * 2)
+    if per_target is None:
+        per_target = float('inf')
+    if not targets:
+        r = client.chat_full(prompt=("List the distinct items to find in this request, "
+                                     "one per line, no numbering, no explanation.\nRequest: "
+                                     + question), max_tokens=60, temperature=0.0, continua=False)
+        targets = [ln.strip(" -\t0123456789.") for ln in (r.text or "").splitlines()]
+        targets = [x for x in targets if 2 < len(x) <= 40][:8]
+    findings, calls, biggest = [], 0, 0
+    _p=matrioska_profile(client)
+    _tl=[_LEGGI,_CERCA,_SFOGLIA]+([_LEGGI_RAMO] if getattr(client,"spill",False) else [])
+    room=max(64,_p["usable_budget"]+furniture_tokens(client,_tl)-furniture_tokens(client,[])-int(max_tokens))
+    rc=int(room*_p["chars_per_token"])
+    for tg in targets:
+        q = str(tg).lower().strip()
+        wins, start = [], 0
+        # Hard limit: la finestra NON DEVE MAI sforare il budget cognitivo
+        hard_limit = max(window, min(int(max_tokens * 4.0 * 1.5), window * 8))
+        hard_limit=max(80,min(hard_limit,rc))
+        while len(wins) < per_target:
+            k = low.find(q, start)
+            if k < 0:
+                break
+            
+            # 1. Confini naturali (frase/paragrafo)
+            a_nat, b_nat = k, k + len(q)
+            while a_nat > 0 and documento[a_nat-1] not in ".!?\n": a_nat -= 1
+            while b_nat < len(documento) and documento[b_nat] not in ".!?\n": b_nat += 1
+            
+            # 2. Se la frase naturale entra nel budget, usala intera
+            if (b_nat - a_nat) <= hard_limit:
+                a, b = a_nat, b_nat
+            else:
+                # 3. IL CONTRARIO: la frase sfora, contraila al budget centrando su q
+                a = max(0, k - hard_limit // 2)
+                b = min(len(documento), k + len(q) + hard_limit // 2)
+                # Aggiusta i bordi per non tagliare parole a meta'
+                if a > 0:
+                    space = documento.find(" ", a, a + 40)
+                    if space != -1 and space < a + 40: a = space + 1
+                if b < len(documento):
+                    space = documento.rfind(" ", max(a, b - 40), b)
+                    if space != -1: b = space
+                    
+            wins.append(documento[a:b].replace("\n", " "))
+            start = k + len(q)
+        if not wins:
+            findings.append((tg, "NOT FOUND"))
+            continue
+        wins = list(dict.fromkeys(wins))
+        v,n,g=_ask_windows(client,wins,tg,question,max_tokens,temperature,room)
+        calls+=n;biggest=max(biggest,g);findings.extend(v)
+
+    # Filter NOT FOUND and present only found values
+    found = [(k, v) for k, v in findings if v != "NOT FOUND" and v.strip() != ""]
+    found=list(dict.fromkeys(found))
+    if not found:
+        return {"text": "NOT FOUND", "meta": {"targets": list(targets), "findings": findings,
+                                               "sub_calls": calls, "biggest_prompt_chars": biggest,
+                                               "found_count": 0, "not_found_count": len(targets)}}
+
+    not_found_count = len(findings) - len(found)
+    righe = "\n".join(f"- {k}: {v}" for k, v in found)
+
+    # Build the synthesis prompt with explicit context
+    p = ("ORIGINAL REQUEST: " + str(question) + "\n\n"
+         + "EXTRACTED VALUES:\n" + righe + "\n\n")
+    if not_found_count > 0:
+        p += ("Note: " + str(not_found_count) + " target(s) had no clear associated value "
+              + "in the document.\n")
+    p += ("Using ONLY the extracted values above, answer the original request.\n"
+          + "If the values are sufficient, provide a complete answer.\n"
+          + "If the values are insufficient, say 'INSUFFICIENT DATA' and explain what is missing.\n"
+          + "Do not invent values that are not in the extracted list.")
+    biggest = max(biggest, len(p))
+    synth_tokens = max(max_tokens or matrioska_profile(client)["answer_tokens"], len(targets) * 20 + 100)
+    r = client.chat_full(prompt=p, max_tokens=synth_tokens, temperature=temperature, continua=False)
+    return {"text": r.text or "", "meta": {"targets": list(targets), "findings": findings,
+                                            "sub_calls": calls + 1, "biggest_prompt_chars": biggest,
+                                            "found_count": len(found), "not_found_count": not_found_count}}
+
+
+def matrioska_profile(client=None, chars_per_token=3.2):
+    """Adaptive matrioska profile derived from archived cognitive/hardware data."""
+    import os
+    raw = 1200
+    cog = None
+    n_ctx = 0
+    hw = {}
+    source = "default"
+    if client is not None:
+        try:
+            info = client._info()
+            n_ctx = int(info.get("n_ctx") or 0)
+        except Exception:
+            info = {}
+        try:
+            hw = dict(client._hw())
+        except Exception:
+            hw = {}
+    if os.environ.get("BOCCONCINI_NO_COGNITIVE") == "1":
+        raw = int(n_ctx * 0.92) if n_ctx else 1200
+        source = "n_ctx"
+    else:
+        try:
+            cog = client._cog_stored()
+        except Exception:
+            cog = None
+        try:
+            raw = int(client.working_budget(reserve=0))
+            source = "cognitive" if cog else ("n_ctx" if n_ctx else "fallback")
+        except Exception:
+            raw = int(n_ctx * 0.92) if n_ctx else 1200
+            source = "n_ctx" if n_ctx else "fallback"
+    overhead = float(hw.get("msg_overhead") or 8.0)
+    overhead = max(0.0, min(64.0, overhead))
+    tl = [_LEGGI, _CERCA, _SFOGLIA] + ([_LEGGI_RAMO] if getattr(client, "spill", False) else [])
+    reserve = furniture_tokens(client, tl) + int(overhead * 8)
+    usable = max(384, int(raw) - reserve)
+    index_budget = max(160, usable // 4)
+    max_facts = max(3, index_budget // 120)
+    row_cost = 28 + 4 * max_facts
+    max_children = max(3, index_budget // max(24, row_cost))
+    leaf_tokens = max(180, int(usable * 0.35))
+    leaf_chars = int(leaf_tokens * max(2.0, float(chars_per_token)))
+    answer_tokens = max(120, usable // 4)
+    if usable < 1200: max_hops = 8
+    elif usable < 2200: max_hops = 7
+    elif usable < 5000: max_hops = 6
+    else: max_hops = 5
+    max_calls = 1 if usable < 2500 else 2
+    return {
+        "source": source, "n_ctx": n_ctx, "cognitive_limit": cog,
+        "raw_window": int(raw), "reserve": reserve, "usable_budget": usable,
+        "index_budget": index_budget, "max_children": int(max_children),
+        "max_facts_per_summary": int(max_facts), "leaf_max_tokens": int(leaf_tokens),
+        "leaf_max_chars": leaf_chars, "answer_tokens": int(answer_tokens),
+        "max_hops": int(max_hops), "max_calls": int(max_calls),
+        "chars_per_token": float(chars_per_token),
+    }
+
+
+def prepare_matrioska_tree(document, session, tree=None, client=None,
+                           max_children=None, leaf_max_chars=None,
+                           leaf_max_tokens=None, max_facts_per_summary=None):
+    """Build a hierarchical (matrioska) tree adapting to the model cognitive budget."""
+    if tree is None:
+        tree = DocTree()
+    profile = matrioska_profile(client) if client is not None else {}
+    if max_children is None: max_children = profile.get("max_children", 8)
+    if leaf_max_chars is None: leaf_max_chars = profile.get("leaf_max_chars", 1500)
+    if leaf_max_tokens is None: leaf_max_tokens = profile.get("leaf_max_tokens", 500)
+    if max_facts_per_summary is None: max_facts_per_summary = profile.get("max_facts_per_summary", 6)
+    max_children = max(2, int(max_children))
+    chunks = split_text(document, name="document.txt", kind="text",
+                        max_chars=leaf_max_chars, max_tokens=leaf_max_tokens,
+                        min_chars=300, overlap=0)
+    all_facts = trova_fatti(document)
+    fact_counts = {}
+    for f in all_facts:
+        fact_counts[f["tipo"]] = fact_counts.get(f["tipo"], 0) + 1
+    signal_rank = {t: i for i, t in enumerate(sorted(fact_counts, key=lambda t: (fact_counts[t], t)))}
+    leaves = []
+    for i, ch in enumerate(chunks):
+        node_id = "leaf_%04d" % i
+        meta = etichetta(ch.text, name="document.txt")
+        chunk_facts = ["%s:%s" % (f['tipo'], f['valore']) for f in all_facts if ch.start <= f['pos'] < ch.end]
+        chunk_facts.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
+        summary = meta["summary"]
+        if chunk_facts:
+            visible = chunk_facts[:max_facts_per_summary]
+            block = "KEY -> " + ", ".join(visible)
+            resto = len(chunk_facts) - len(visible)
+            if resto: block += " (+%d more in branch)" % resto
+            summary = block + (" | " + summary if summary else "")
+        leaves.append(DocNode(id=node_id, label="Section %d (chars %d-%d)" % (i, ch.start, ch.end),
+                              summary=summary, text=ch.text, tokens=ch.token_count_estimate(), children=[]))
+    current_level = leaves
+    level_num = 0
+    while len(current_level) > max_children:
+        next_level = []
+        for i in range(0, len(current_level), max_children):
+            group = current_level[i:i + max_children]
+            level_num += 1
+            container_id = "cont_%d_%03d" % (level_num, i // max_children)
+            first_label = group[0].label.split("(")[0].strip()
+            last_label = group[-1].label.split("(")[0].strip()
+            container_label = "Container (%s ... %s)" % (first_label, last_label)
+            container_facts = []
+            for child in group:
+                if "KEY -> " in child.summary:
+                    fact_block = child.summary.split("KEY -> ")[1].split(" | ")[0]
+                    facts = [f.strip() for f in fact_block.split(",") if f.strip()]
+                    container_facts.extend(facts)
+            unique_facts = list(dict.fromkeys(container_facts))
+            unique_facts.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
+            container_summary = ""
+            if unique_facts:
+                visible = unique_facts[:max_facts_per_summary]
+                block = "KEY -> " + ", ".join(visible)
+                resto = len(unique_facts) - len(visible)
+                if resto: block += " (+%d more in sub-branches)" % resto
+                container_summary = block
+            container = DocNode(id=container_id, label=container_label, summary=container_summary,
+                                text="", tokens=sum(c.tokens for c in group), children=group)
+            next_level.append(container)
+        current_level = next_level
+    tree.save(session, current_level)
+    return tree, session
+
+
+def _read_cap(client, msgs, tt, budget, answer, pages, cpt):
+    room = int(budget) - client._prompt_tokens(msgs, tt) - max(0, int(answer))
+    return max(1, int(room / max(1, int(pages)) * float(cpt)))
+
+
+def _tools_tokens(client, tools):
+    if not tools:
+        return 0
+    s = json.dumps(tools, ensure_ascii=False)
+    return int(getattr(client,"_exact_content",lambda x:0)(s) or (len(s) / 2.5 + 1))
+
+def _fit_batches(wins, room):
+    """Pack windows into batches that fit room tokens. Nothing is dropped."""
+    out, cur, used = [], [], 0
+    for w in wins:
+        n = estimate_tokens(w)
+        if cur and used + n > room:
+            out.append(cur); cur, used = [], 0
+        cur.append(w); used += n
+    if cur:
+        out.append(cur)
+    return out
+
+def _tok_path():
+    return Path(os.environ.get('BOCCONCINI_CACHE',str(Path.home()/'.cache'/'bocconcini')))/'token_costs.json'
+def _tok_read():
+    try: return json.loads(_tok_path().read_text('utf-8')).get('entries',{})
+    except Exception: return {}
+def _tok_store(k,v):
+    try:
+        p=_tok_path(); p.parent.mkdir(parents=True,exist_ok=True)
+        d={'version':1,'entries':_tok_read()}; d['entries'][k]=int(v)
+        t=p.with_suffix('.tmp'); t.write_text(json.dumps(d),'utf-8'); os.replace(t,p)
+    except Exception: pass
+def furniture_tokens(client,tools):
+    import hashlib
+    s=json.dumps(tools,ensure_ascii=False)
+    try: k=client._hw_key()
+    except Exception: k=''
+    k+='|'+hashlib.blake2b((_REGOLE+'\x00'+s).encode('utf-8','replace'),digest_size=8).hexdigest()
+    e=_tok_read().get(k)
+    if e is not None: return int(e)
+    try: r=client._exact_content(_REGOLE); q=client._exact_content(s)
+    except Exception: r=q=None
+    if r is not None and q is not None:
+        _tok_store(k,int(r)+int(q)); return int(r)+int(q)
+    return estimate_tokens(_REGOLE)+estimate_tokens(s,'json')
+
+def _tree_depth(roots):
+    """Maximum depth measured from the tree structure; no model calls."""
+    seen=set(); stack=[(r,1) for r in roots]; best=0
+    while stack:
+        n,d=stack.pop(); nid=str(n.get("id",""))
+        if nid in seen: continue
+        seen.add(nid); best=max(best,d)
+        stack.extend((c,d+1) for c in (n.get("children") or []))
+    return best
+
+
+=== bocconcini/rami.py ===
+"""Spill senza perdita: il contenuto va su disco, nel prompt resta l'indice.
+
+Nessun messaggio viene cancellato durante il loop. Il modello apre un ramo
+per indirizzo e riottiene i byte identici. Zero dipendenze, Python 3.7+.
+"""
+import hashlib
+import json
+import os
+import re
+
+
+def _tipo(testo):
+    s = testo.lstrip()
+    if s[:1] in "{[":
+        try:
+            json.loads(s)
+            return "json"
+        except Exception:
+            pass
+    if re.search(r"^\s*(def |class |@|import |from )", testo, re.M):
+        return "codice"
+    return "testo"
+
+
+def _anteprima(testo, max_righe=6):
+    t = _tipo(testo)
+    if t == "json":
+        try:
+            o = json.loads(testo)
+            if isinstance(o, dict):
+                return "chiavi: " + ", ".join(list(o.keys())[:12])
+            return "lista di %d elementi" % len(o)
+        except Exception:
+            pass
+    if t == "codice":
+        righe = []
+        for i, r in enumerate(testo.splitlines(), 1):
+            if re.match(r"\s*(def |class |@)", r):
+                righe.append("%d:%s" % (i, r.strip()[:60]))
+            if len(righe) >= max_righe:
+                break
+        if righe:
+            return " | ".join(righe)
+    return re.sub(r"\s+", " ", testo.strip().split(". ")[0])[:100]
+
+
+class Spill:
+    """Contenuto su disco, indice append-only in memoria."""
+
+    def __init__(self, cartella):
+        self.cartella = str(cartella)
+        os.makedirs(self.cartella, exist_ok=True)
+        self._voci = []
+        self._id = {}
+
+    def put(self, contenuto, etichetta="ramo", tipo=None):
+        if isinstance(contenuto, str):
+            testo = contenuto
+        else:
+            testo = json.dumps(contenuto, ensure_ascii=False, sort_keys=True)
+        dati = testo.encode("utf-8")
+        digest = hashlib.sha256(dati).hexdigest()[:12]
+        nome = re.sub(r"[^A-Za-z0-9_]+", "_", etichetta)[:24]
+        ident = "%s-%s" % (nome, digest)
+        if ident not in self._id:
+            percorso = os.path.join(self.cartella, ident + ".txt")
+            with open(percorso, "wb") as f:
+                f.write(dati)
+            self._id[ident] = percorso
+            self._voci.append({"id": ident, "byte": len(dati),
+                               "tipo": tipo or _tipo(testo),
+                               "anteprima": _anteprima(testo)})
+        return ident
+
+    def get(self, ident):
+        with open(self._id[ident], "rb") as f:
+            return f.read().decode("utf-8")
+
+    def indice(self):
+        return "\n".join("[%s] %s %d byte - %s" % (v["id"], v["tipo"],
+                         v["byte"], v["anteprima"]) for v in self._voci)
+
+
+def spill_messaggi(msgs, store, soglia_caratteri=640, prefisso="tool"):
+    """Sostituisce i contenuti oltre soglia con la loro voce d'indice.
+
+    NON cancella messaggi. L'ultimo non si tocca mai: e' la richiesta.
+    Un messaggio con ``pin: True`` resta in linea per intero, a qualunque
+    dimensione: chi lo marca si prende la responsabilita' del budget.
+    """
+    out = []
+    ultimo = len(msgs) - 1
+    for i, m in enumerate(msgs):
+        c = m.get("content")
+        if (not isinstance(c, str) or i == ultimo or m.get("pin")
+                or len(c) <= soglia_caratteri):
+            out.append(m)
+            continue
+        ident = store.put(c, etichetta="%s%d" % (prefisso, i))
+        voce = dict(m)
+        voce['content'] = '[content on disk: id=%s, %d bytes. Preview: %s]' % (ident, len(c.encode()), _anteprima(c))
+        voce["ramo"] = ident
+        out.append(voce)
+    return out
+
+def archive_message(m, client, label="hist"):
+    """Move one message content to disk; keep a reversible stub."""
+    if getattr(client,"_store",None) is None:
+        import tempfile
+        client._store = Spill(getattr(client,"spill_dir",None) or tempfile.mkdtemp())
+    rid = client._store.put(m.get("content") or "", etichetta=label)
+    return dict(m, content="[content on disk: id=%s. Ask leggi_ramo for it]" % rid, ramo=rid, _stub=True)

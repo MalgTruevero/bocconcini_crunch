@@ -1,0 +1,100 @@
+        summary_base = meta_etichetta["summary"]
+        extra_leaves = []
+        if fatti_nel_chunk:
+            # Split into blocks that each fit the derived cap: nothing is dropped,
+            # every overflow block becomes its own leaf after this section.
+            blocks, cur, used = [], [], 0
+            for f in fatti_nel_chunk:
+                f = f if len(f) <= 80 else f[:77] + "..."
+                if cur and used + len(f) + 2 > tetto:
+                    blocks.append(cur)
+                    cur, used = [f], len(f) + 2
+                else:
+                    cur.append(f)
+                    used += len(f) + 2
+            if cur:
+                blocks.append(cur)
+            block = "CHIAVE -> " + ", ".join(blocks[0])
+            resto = len(fatti_nel_chunk) - len(blocks[0])
+            if resto:
+                block += " (+%d altri nel ramo)" % resto
+            summary_base = block + (" | " + summary_base if summary_base else "")
+            for n, blk in enumerate(blocks[1:], start=1):
+                body = "CHIAVE -> " + ", ".join(blk)
+                extra_leaves.append(DocNode(
+                    id="%s_facts_%d" % (node_id, n),
+                    label="Facts %d of section %d (pos %d-%d)" % (n, i, ch.start, ch.end),
+                    summary=body,
+                    text=body,
+                    tokens=max(1, int(len(body) / cpt)),
+                ))
+
+        roots.append(DocNode(
+            id=node_id,
+            label=f"Sezione {i} (pos {ch.start}-{ch.end})",
+            summary=summary_base,
+            text=ch.text,
+            tokens=ch.token_count_estimate()
+        ))
+        roots.extend(extra_leaves)
+
+    # 4. Salvataggio dell'albero
+    # --- Matriosca: raggruppa le foglie in macro-blocchi padre->figli ---
+    if max_children is None:
+        max_children = int(prof.get("max_children", 8))
+    max_children = max(2, int(max_children))
+    if mode in ("matriosca", "auto"):
+        level = 0
+        while len(roots) > max_children:
+            level += 1
+            parents = []
+            for g in range(0, len(roots), max_children):
+                gruppo = roots[g:g + max_children]
+                # Facts come from the children summaries, never from positional
+                # chunk indices: extra fact leaves must not shift the spans.
+                seen = []
+                for c in gruppo:
+                    if "CHIAVE -> " in (c.summary or ""):
+                        blk = c.summary.split("CHIAVE -> ", 1)[1].split(" | ", 1)[0]
+                        blk = blk.split(" (+", 1)[0]
+                        for v in blk.split(","):
+                            v = v.strip()
+                            if v and v not in seen:
+                                seen.append(v)
+                seen.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
+                block = ""
+                if seen:
+                    shown, used = [], 0
+                    for v in seen:
+                        if shown and used + len(v) + 2 > tetto:
+                            break
+                        shown.append(v)
+                        used += len(v) + 2
+                    block = "CHIAVE -> " + ", ".join(shown)
+                    if len(seen) > len(shown):
+                        block += " (+%d altri nel ramo)" % (len(seen) - len(shown))
+                if not block:
+                    parts = [c.summary for c in gruppo if c.summary]
+                    if parts:
+                        block = " | ".join(parts)
+                        if len(block) > tetto * 2:
+                            block = block[:tetto * 2 - 3] + "..."
+                ordinals = [int(c.id[4:7]) for c in gruppo
+                            if c.id.startswith("sec_") and c.id[4:7].isdigit()]
+                if ordinals:
+                    span_label = "sezioni %d-%d" % (min(ordinals), max(ordinals))
+                else:
+                    span_label = "%s ... %s" % (gruppo[0].label.split("(")[0].strip(),
+                                        gruppo[-1].label.split("(")[0].strip())
+                nid = "macro_%02d" % (g // max_children)
+                if level > 1:
+                    nid = "macro_l%d_%02d" % (level, g // max_children)
+                parents.append(DocNode(
+                    id=nid,
+                    label="Macro-block %d (%s)" % (g // max_children, span_label),
+                    summary=block,
+                    text="",
+                    tokens=sum(c.tokens for c in gruppo),
+                    children=gruppo,
+                ))
+            roots = parents

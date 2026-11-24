@@ -1,0 +1,22 @@
+                # Complete units only: sentence ends or line breaks, never inside
+                # a sentence or a code line, where a cut splits one fact in two.
+                units = [u.strip() for u in re.split(r"(?<=[.!?])\s+|\n", old) if u.strip()]
+                hit = [any(w in u.lower() for w in words) for u in units]
+                skeleton = ("[branch %s evicted from context. Text stays on disk; "
+                            "ask leggi_nodo for %s again]" % (nid, nid))
+                msgs[target]["content"] = skeleton
+                base = cost(msgs) if cost is not None else _msg_tokens(msgs, cpt, per_msg)
+                # Spare capacity from the measured cognitive window, not a fixed
+                # ceiling: a bigger model or a faster machine keeps more context.
+                room = int(max(0, budget - base) * cpt)
+                used = sum(len(u) + 1 for u, h in zip(units, hit) if h)
+                chosen = []
+                for j, (u, h) in enumerate(zip(units, hit)):
+                    if h:
+                        chosen.append(j)
+                    elif used + len(u) + 1 <= room:
+                        chosen.append(j)
+                        used += len(u) + 1
+                # Question-matching units are always kept whole: dropping them
+                # would be a real loss, the forced answer has no tools to recover.
+                kept = " ".join(units[j] for j in chosen)

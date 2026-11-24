@@ -31,4 +31,3 @@ Benchmark = "https://github.com/MalgTruevero/bocconcini_crunch/blob/main/benchma
 
 [tool.setuptools]
 packages = ["bocconcini"]
-py-modules = ["bocconcini_tree"]
