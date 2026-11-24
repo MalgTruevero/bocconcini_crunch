@@ -964,6 +964,15 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
         >>> tree, session = t.prepara_albero_ricco(documento_enorme, "test")
         >>> risultato = t.naviga(client, tree, session, domanda, budget_tokens=1500)
     """
+    if client is not None:
+        try:
+            budget = client.working_budget(reserve=0)
+            effective_tetto = max(180, int(budget * 0.02))
+        except Exception:
+            effective_tetto = max(180, int(max_chars * 0.15))
+    else:
+        effective_tetto = max(180, int(max_chars * 0.15))
+
     if tree is None:
         tree = DocTree()
     
@@ -972,7 +981,7 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
                        max_chars=max_chars, max_tokens=10000, min_chars=300, overlap=0)
     
     # 2. Estrazione deterministica di tutti i fatti
-    tutti_i_fatti = trova_fatti(documento)
+    tutti_i_fatti = trova_fatti(documento, max_per_tipo=max_per_tipo)
     fact_counts = {}
     for f in tutti_i_fatti:
         fact_counts[f["tipo"]] = fact_counts.get(f["tipo"], 0) + 1
@@ -998,18 +1007,28 @@ def prepara_albero_ricco(documento: str, sessione: str, tree: Optional["DocTree"
         fatti_nel_chunk.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
         summary_base = meta_etichetta["summary"]
         if fatti_nel_chunk:
-            visibili, usati = [], 0
+            fact_blocks = []
+            current_block, current_len = [], 0
             for f in fatti_nel_chunk:
-                f = f if len(f) <= 80 else f[:77] + "..."
-                if visibili and usati + len(f) + 2 > tetto_fatti:
-                    break
-                visibili.append(f)
-                usati += len(f) + 2
-            blocco = "CHIAVE -> " + ", ".join(visibili)
-            resto = len(fatti_nel_chunk) - len(visibili)
-            if resto:
-                blocco += " (+%d altri nel ramo)" % resto
-            summary_base = blocco + (" | " + summary_base if summary_base else "")
+                f_str = f if len(f) <= 80 else f[:77] + "..."
+                if current_block and current_len + len(f_str) + 2 > effective_tetto:
+                    fact_blocks.append(", ".join(current_block))
+                    current_block, current_len = [f_str], len(f_str)
+                else:
+                    current_block.append(f_str)
+                    current_len += len(f_str) + 2
+            if current_block:
+                fact_blocks.append(", ".join(current_block))
+            summary_base = "CHIAVE -> " + fact_blocks[0] + (" | " + summary_base if summary_base else "")
+            for idx, block in enumerate(fact_blocks[1:], start=1):
+                child_id = f"{node_id}_facts_{idx}"
+                roots.append(DocNode(
+                    id=child_id,
+                    label=f"Additional facts for Section {i} (block {idx})",
+                    summary="Extracted facts exceeding parent block limit",
+                    text=f"CHIAVE -> {block}",
+                    tokens=len(block) // 4
+                ))
         
         roots.append(DocNode(
             id=node_id,
