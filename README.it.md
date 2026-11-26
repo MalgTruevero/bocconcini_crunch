@@ -3,6 +3,23 @@
 Client Python per LLM locali con finestra utile piccola. **Zero dipendenze runtime.**
 Nata su Samsung S20 Ultra / Termux, per non mentire su cio' che ha fatto.
 
+## Matrioska: aghi oltre la finestra
+`ask_stepwise` trova fatti in documenti molto piu' grandi della finestra
+cognitiva: Python cerca su tutto il testo e conserva ogni risultato; il modello
+vede solo finestre verbatim piccole, un bersaglio per contesto fresco. Nulla
+viene evacuato.
+- Misurato dal vivo (smol-tools-4b, Samsung S20 Ultra): tutorial Python reale,
+  131.313 caratteri = 10x il contesto da 4.096 token; 6/6 aghi, 7 sotto-chiamate,
+  prompt massimo 676 caratteri.
+- Ricerca ed estrazione tolleranti alla parafrasi (nessun match letterale richiesto).
+- Tetto di finestre per bersaglio derivato dalla frequenza: le parole frequenti
+  non fanno esplodere le chiamate.
+
+## Si adatta a dispositivo e modello
+`matrioska_profile` ricava finestre, budget e spazio di risposta da `n_ctx`,
+finestra cognitiva e hardware misurati. Nessun tetto fisso tarato su un
+dispositivo: cambi dispositivo o modello e le equazioni si rideterminano.
+
 ## Stato verificato
 
 - Verificato dal vivo: KoboldCpp, Samsung S20 Ultra, smol-tools-4b.

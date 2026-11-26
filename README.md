@@ -27,6 +27,22 @@ bocconcini fixes the pipeline, not the model:
 Why "bocconcini"? A child, a huge cake, a small mouth: [STORIA.md](STORIA.md).
 Italian edition: [README.it.md](README.it.md).
 
+## Matrioska: needles far beyond the window
+`ask_stepwise` finds facts in documents far larger than the cognitive window:
+Python searches the whole text and keeps every finding; the model sees only
+small verbatim windows, one target per fresh context. Nothing is evicted.
+- Measured live (smol-tools-4b, Samsung S20 Ultra): real Python tutorial,
+  131,313 chars = 10x the 4,096-token context; 6/6 needles, 7 sub-calls,
+  largest prompt 676 chars.
+- Paraphrase-tolerant search and extraction (no verbatim match required).
+- Per-target window cap derived from term frequency: frequent words do not
+  explode the call count.
+
+## Adapts to device and model
+`matrioska_profile` derives windows, budgets and answer room from measured
+`n_ctx`, cognitive window and hardware. No fixed caps tuned on one device:
+change device or model and the equations re-derive themselves.
+
 ## Verification status
 
 - **Verified live:** KoboldCpp, Samsung S20 Ultra, smol-tools-4b.
