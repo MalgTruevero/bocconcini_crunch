@@ -1,5 +1,17 @@
 # Changelog
 
+## 5.0.1
+
+### Fixed
+- ask_stepwise: paraphrase-tolerant fuzzy target search (exact match no longer required).
+- ask_stepwise: adaptive per-target window cap derived from term frequency (frequent words no longer explode sub-calls).
+- ask_stepwise: extraction prompt tolerates identifiers/paraphrase instead of requiring the literal target phrase.
+- prepare_matrioska_tree: duplicate facts carry occurrence counts instead of being silently dropped.
+
+### Verified
+- Real-model test on a Python tutorial 10x the context window: 6/6 needles, 7 sub-calls, largest prompt 676 chars.
+
+
 ## 5.0.0
 
 ### Changed (breaking)

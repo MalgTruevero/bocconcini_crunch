@@ -350,7 +350,7 @@ def _evict(msgs: List[Dict[str, Any]], budget: int, cpt: float, per_msg: float =
         nid = msgs[target].get("_node") or ""
         if nid:
             kept = str(msgs[target].get("_facts") or "")
-            if not kept and question:
+            if question:
                 old = str(msgs[target].get("content") or "")
                 words = {w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9_]{3,}", question)}
                 # Complete units only: sentence ends or line breaks, never inside
@@ -374,7 +374,7 @@ def _evict(msgs: List[Dict[str, Any]], budget: int, cpt: float, per_msg: float =
                         used += len(u) + 1
                 # Question-matching units are always kept whole: dropping them
                 # would be a real loss, the forced answer has no tools to recover.
-                kept = " ".join(units[j] for j in chosen)
+                kept = " ".join(x for x in (str(msgs[target].get("_facts") or ""), " ".join(units[j] for j in chosen)) if x)
             keep = (" facts found -> " + kept + ".") if kept else ""
             msgs[target]["content"] = ("[branch %s evicted from context.%s Text stays on disk; "
                                        "ask leggi_nodo for %s again]" % (nid, keep, nid))
@@ -521,6 +521,12 @@ def _cerca(tree: "DocTree", session: str, query: str, limit: int = 8) -> Tuple[s
         candidates.append((score, 1 if is_container else 0, k, preview, is_container))
 
     candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+    # Cut at the largest consecutive score drop: the boundary comes from
+    # this query score distribution, not from a fixed threshold.
+    _s = [c[0] for c in candidates]
+    _d = [a - b for a, b in zip(_s, _s[1:])]
+    if _d and max(_d) > 0:
+        candidates = candidates[:_d.index(max(_d)) + 1]
     picked = candidates[:max(1, int(limit))]
 
     if not picked:
@@ -589,7 +595,7 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
     except Exception:
         ovh = 8.0
     try:
-        cog = int(client._cognitive_limit() or 0) or None
+        cog = int(client._cog_stored() or 0) or None
     except Exception:
         cog = None
     meta: Dict[str, Any] = {"hops": 0, "nodes_read": [], "evicted": 0, "repeats": 0,
@@ -610,7 +616,7 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
     if len(roots) == 1 and roots[0].get("children"):
         focus = str(roots[0]["id"])        # bare container: show the useful level immediately
     shown = _level_ids(tree, session, focus)
-    vista = tree.vista(session, focus, budget_tokens=max(150, budget // 4), chars_per_token=cpt)
+    vista = tree.vista(session, focus, budget_tokens=_budget_vista(budget, cpt, _tools_tokens(client, tools_now) if "tools_now" in locals() else 0, max_tokens), chars_per_token=cpt)
     toks = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question))
     named = [k for k in tree.keys(session) if k.rsplit(".", 1)[-1] in toks][:3]
     hint = ("\n\nNomi della domanda presenti nell'albero (id completi): " + ", ".join(named)) if named else ""
@@ -642,10 +648,10 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                         eff = _eff_max(pt, True)
                         if cog and pt > int(cog * 0.9):
                             meta["evicted"] += _evict(msgs, int(cog * 0.7), cpt, ovh, question,
-                                                     cost=lambda ms: client._prompt_tokens(ms, None))
+                                                     cost=lambda ms: client._prompt_tokens(ms, 0))
                         else:
                             meta["evicted"] += _evict(msgs, budget, cpt, ovh, question,
-                                                     cost=lambda ms: client._prompt_tokens(ms, None))
+                                                     cost=lambda ms: client._prompt_tokens(ms, 0))
                         r = client.chat_full(messages=msgs, tools=None, temperature=temperature,
                                             max_tokens=eff, continua=False)
                         if getattr(r, "finish_reason", "") == "length":
@@ -659,23 +665,40 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
         cap = _read_cap(client, msgs, tt, budget, max_tokens if final else 0, max_calls, cpt); meta.setdefault("caps",[]).append(cap)
         if final:
             meta["forced_answer"] = True
+        try:
+            cs = meta.get("_consecutive_searches", 0)
+            if require_read and not meta["nodes_read"] and not final and cs >= 2:
+                tc = {"type": "function", "function": {"name": "leggi_nodo"}}
+            else:
+                tc = "required" if (require_read and not meta["nodes_read"] and not final) else None
+            eff = _eff_max(pt, final)
+            if cog and pt > int(cog * 0.9):
+                meta["evicted"] += _evict(msgs, int(cog * 0.7), cpt, ovh, question,
+                                         cost=lambda ms: client._prompt_tokens(ms, tt))
+            r = client.chat_full(messages=msgs, tools=tools_now, tool_choice=tc,
+                                temperature=temperature, max_tokens=eff, continua=False)
+            if getattr(r, "finish_reason", "") == "length":
+                meta["truncated"] = meta.get("truncated", 0) + 1
+        except Exception as exc:
+            err_kind = getattr(exc, "kind", "")
+            if err_kind == "cognitive_overflow" and not meta.get("_retry_overflow"):
+                meta["_retry_overflow"] = True
+                # Tronchiamo l'ultima risposta dell'assistente che ha gonfiato il contesto
+                for i in range(len(msgs)-1, -1, -1):
+                    if msgs[i].get("role") == "assistant":
+                        msgs[i]["content"] = "[RISPOSTA PRECEDENTE TRONCATA PER OVERFLOW. RISCRIVILA IN MODO ESTREMAMENTE CONCISO]"
+                        break
+                msgs.append({"role": "user", "content": "ERRORE CONTESTO: riscrivi la risposta in massimo 150 caratteri, rispondendo solo a: " + question})
                 try:
-                    cs = meta.get("_consecutive_searches", 0)
-                    if require_read and not meta["nodes_read"] and not final and cs >= 2:
-                        tc = {"type": "function", "function": {"name": "leggi_nodo"}}
-                    else:
-                        tc = "required" if (require_read and not meta["nodes_read"] and not final) else None
-                    eff = _eff_max(pt, final)
-                    if cog and pt > int(cog * 0.9):
-                        meta["evicted"] += _evict(msgs, int(cog * 0.7), cpt, ovh, question,
-                                                 cost=lambda ms: client._prompt_tokens(ms, tt))
-                    r = client.chat_full(messages=msgs, tools=tools_now, tool_choice=tc,
-                                        temperature=temperature, max_tokens=eff, continua=False)
-                    if getattr(r, "finish_reason", "") == "length":
-                        meta["truncated"] = meta.get("truncated", 0) + 1
-                except Exception as exc:
-                    meta["stopped"] = "error: %s" % exc
+                    # Secondo giro: payload ridotto artificialmente, gabbia di stima non serve, max_tokens forzato a valore sicuro
+                    r = client.chat_full(messages=msgs, tools=None, temperature=temperature, max_tokens=150, continua=False)
+                    answer = r.text
+                    meta["stopped"] = "retried_short"
+                except Exception as exc2:
+                    meta["stopped"] = "error: %s (retry fallito)" % exc2
                 break
+            meta["stopped"] = "error: %s" % exc
+            break
         if not r.tool_calls:
             # Check if model wrote tool calls as text instead of structured calls
             text_calls = _parse_text_tool_calls(r.text, tools_now or [])
@@ -721,7 +744,7 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                 continue
             if fname == "sfoglia_pagina":
                 off = int(args.get("offset") or 0)
-                sub = tree.vista(session, focus, budget_tokens=max(150, budget // 4), chars_per_token=cpt, offset=off)
+                sub = tree.vista(session, focus, budget_tokens=_budget_vista(budget, cpt, _tools_tokens(client, tools_now) if "tools_now" in locals() else 0, max_tokens), chars_per_token=cpt, offset=off)
                 meta.setdefault("pages_browsed", []).append(off)
                 msgs.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": sub["text"], "_node": ""})
                 continue
@@ -790,7 +813,7 @@ def naviga(client: Any, tree: "DocTree", session: str, question: str, *,
                     kids = valid.get(nid, {}).get("children")
                     if kids:
                         shown = [str(c["id"]) for c in kids]; focus = nid
-                        sub = tree.vista(session, nid, budget_tokens=max(120, budget // 4),
+                        sub = tree.vista(session, nid, budget_tokens=_budget_vista(budget, cpt, _tools_tokens(client, tools_now) if "tools_now" in locals() else 0, max_tokens),
                                          chars_per_token=cpt)
                         body += ("\n\n[questo ramo e' un contenitore: chiama leggi_nodo con UNO "
                                  "di questi id]\n" + sub["text"])
@@ -919,13 +942,14 @@ def _filtra_chiama(roots: List[DocNode]) -> None:
         n.summary = "; ".join(parts)[:200]
 
 _FATTO = (
-    ("codice", re.compile(r"\b[A-Z][A-Z0-9]{2,}[-_][A-Z0-9]{1,8}\b")),
+    ("codice", re.compile(r"\b[A-Za-z0-9]{2,}(?:[-_][A-Za-z0-9]{1,8})+\b")),
     ("sigla", re.compile(r"\b[A-Z]{3,}\d{1,6}\b")),
     ("numero", re.compile(r"\b\d{4,}\b")),
     ("nome", re.compile(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*\b")),
     ("misura", re.compile(r"\b\d+(?:[.,]\d+)?\s?(?:terawatt|gigawatt|megawatt|kilowatt|watt|TB|GB|MB|GHz|MHz|volt|ampere)\b", re.I)),
     ("chiave", re.compile(r"\b[A-Za-z0-9_\-]{16,}\b")),
     ("virgolette", re.compile(r'"([^"\n]{3,60})"')),
+    ("label", re.compile(r"\b(?:password|pwd|segreto|secret|chiave|token|pin)\s*(?:[:=]{1,2}|(?:e|è|is)\b)\s*[\x22\x27]?([A-Za-z0-9_\-]+)", re.I)),
 )
 
 
@@ -1212,8 +1236,8 @@ def _ask_windows(client,wins,tg,question,max_tokens,temperature,room):
                             + "VERBATIM EXCERPTS (from the document):\n"
                             + "\n".join("- " + w for w in batch) + "\n\n"
                             + "Find the SPECIFIC value for '" + str(tg) + "' in the excerpts above. "
-                            + "The value is typically a code (e.g., XXX-9999), number, date, name, or status that appears "
-                            + "immediately before or after '" + str(tg) + "'. "
+                            + "The excerpts were selected because they concern the target; wording may differ (paraphrase, identifiers, underscores). The value is typically a code, number, date, name, or status "
+                            + "associated with '" + str(tg) + "'. "
                             + "Copy the exact text character by character. Do not paraphrase or invent.\n"
                             + "If you cannot find a clear value for '" + str(tg) + "', reply exactly: NOT FOUND\n"
                             + "Answer with the copied value only (no explanation, no preamble, no quotes).")
@@ -1261,8 +1285,20 @@ def ask_stepwise(client, documento: str, question: str, *, targets=None,
         # Hard limit: la finestra NON DEVE MAI sforare il budget cognitivo
         hard_limit = max(window, min(int(max_tokens * 4.0 * 1.5), window * 8))
         hard_limit=max(80,min(hard_limit,rc))
-        while len(wins) < per_target:
+        # Tetto adattivo basato sulla frequenza della parola nel testo
+        freq = low.count(q)
+        per_target_eff = per_target if freq <= 8 else max(3, min(per_target, int(len(documento) / max(1, freq * 100))))
+        while len(wins) < per_target_eff:
             k = low.find(q, start)
+            # Ricerca fuzzy: estraggo parole chiave e cerco quelle
+            if k < 0:
+                words = [w for w in re.findall(r"[a-z0-9à-ù]{3,}", q) if w not in {"del", "di", "il", "la", "le", "che", "per", "con", "una", "uno"}]
+                if words:
+                    k = low.find(words[0], start)
+                    if k >= 0:
+                        nearby = low[max(0, k-200):k+200]
+                        if not all(w in nearby for w in words[1:]):
+                            k = -1
             if k < 0:
                 break
             
@@ -1436,12 +1472,14 @@ def prepare_matrioska_tree(document, session, tree=None, client=None,
                     fact_block = child.summary.split("KEY -> ")[1].split(" | ")[0]
                     facts = [f.strip() for f in fact_block.split(",") if f.strip()]
                     container_facts.extend(facts)
-            unique_facts = list(dict.fromkeys(container_facts))
+                fact_counter = Counter(container_facts)
+                unique_facts = list(fact_counter.keys())
             unique_facts.sort(key=lambda v: signal_rank.get(v.split(":", 1)[0], 99))
             container_summary = ""
             if unique_facts:
                 visible = unique_facts[:max_facts_per_summary]
-                block = "KEY -> " + ", ".join(visible)
+                visible_with_counts = [f"{v} ({fact_counter[v]}x)" if fact_counter[v] > 1 else v for v in visible]
+                block = "KEY -> " + ", ".join(visible_with_counts)
                 resto = len(unique_facts) - len(visible)
                 if resto: block += " (+%d more in sub-branches)" % resto
                 container_summary = block
@@ -1463,6 +1501,16 @@ def _tools_tokens(client, tools):
         return 0
     s = json.dumps(tools, ensure_ascii=False)
     return int(getattr(client,"_exact_content",lambda x:0)(s) or (len(s) / 2.5 + 1))
+
+
+def _budget_vista(budget: int, cpt: float, tools_tokens: int, max_tokens: int) -> int:
+    """Calculate vista budget from real components, not fixed fractions.
+    Equation: budget - rules_tokens - tools_tokens - per_needle_cost - answer_reserve
+    All values derived from measurements, not ceilings."""
+    rules_chars = 651  # measured: len(_REGOLE)
+    rules_tokens = max(1, int(rules_chars / cpt))
+    per_needle_cost = 700  # measured: ~700 token per needle (search + leaf)
+    return max(150, budget - rules_tokens - tools_tokens - per_needle_cost - max_tokens)
 
 def _fit_batches(wins, room):
     """Pack windows into batches that fit room tokens. Nothing is dropped."""

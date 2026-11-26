@@ -160,7 +160,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-__version__ = "5.0.0"
+__version__ = "5.0.1"
 __all__ = [
     "Chunk", "ChatReply", "ModelError", "TokenCounter", "TokenCounterLike",
     "estimate_tokens", "detect_kind", "iter_chunks", "split_text", "split_thinking", "strip_thinking",
@@ -1119,7 +1119,7 @@ class _ReentrantSemaphore:
         if count > 0:
             self._local.count = count + 1
             return True
-        if not self._sem.acquire(timeout=timeout if timeout is not None else -1):
+        if not self._sem.acquire(timeout=timeout if timeout is not None else None):
             return False
         self._local.count = 1
         return True
@@ -1242,7 +1242,7 @@ def lavoro_atomico(base_url: str = "", blocca_altri: bool = True, timeout_attesa
             _save_parallel_cache(base_url, cached)
     with _GATE_MUTEX:
         lk = _GATES.setdefault(key, _ReentrantSemaphore(cached))
-    if not lk.acquire(timeout=-1 if timeout_attesa is None else float(timeout_attesa)):
+    if not lk.acquire(timeout=None if timeout_attesa is None else float(timeout_attesa)):
         raise ModelError("another job is still running on %s" % key, kind="busy")
     with _GATE_MUTEX:
         _GATE_DEPTH[key] = _GATE_DEPTH.get(key, 0) + 1
@@ -1914,7 +1914,7 @@ class LlamaCppClient:
         if n is None:
             n = estimate_tokens(text, detect_kind(text))
         per_msg = self._hw().get("msg_overhead") or 8.0
-        return n + int(per_msg * len(msgs)) + tools_tokens
+        return n + int(per_msg * len(msgs)) + int(tools_tokens or 0)
 
     # -- cognitive window ----------------------------------------------------
     # Nominal n_ctx is not the usable window: a small model can hold 4096 tokens
